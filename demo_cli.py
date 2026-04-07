@@ -5,6 +5,10 @@
 # Copyright (C) 2024-present Naver Corporation. All rights reserved.
 # Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
 
+"""
+python demo_cli.py --images path/to/image1.jpg path/to/image2.jpg --output path/to/output_directory
+"""
+
 import functools
 import os
 import sys

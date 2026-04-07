@@ -402,6 +402,9 @@ class Splatt3RWithSMPLX(L.LightningModule):
             losses['transl'] = torch.tensor(0.0, device=device)
 
         # 5. MPJPE via SMPL-X body model forward pass
+        losses['mpjpe'] = torch.tensor(0.0, device=device)
+        losses['mpjpe_mm'] = torch.tensor(0.0, device=device)  # unweighted mm, logged as accuracy
+
         if self.smplx_body_model is not None and self.lambda_joints > 0 and 'smplx_betas' in batch:
             try:
                 out_pred = self.smplx_body_model(
@@ -430,19 +433,15 @@ class Splatt3RWithSMPLX(L.LightningModule):
                     transl=batch['smplx_transl'],
                     return_verts=False,
                 )
-                # Use only the 22 main body joints for efficiency
                 pred_j = out_pred.joints[:, :22, :]
                 gt_j   = out_gt.joints[:, :22, :]
-                losses['mpjpe'] = self.lambda_joints * torch.mean(
-                    torch.norm(pred_j - gt_j, dim=-1)
-                )
+                mpjpe_raw = torch.norm(pred_j - gt_j, dim=-1).mean()
+                losses['mpjpe']    = self.lambda_joints * mpjpe_raw
+                losses['mpjpe_mm'] = mpjpe_raw.detach() * 1000.0  # metres → mm
             except Exception as e:
                 print(f"MPJPE computation failed: {e}")
-                losses['mpjpe'] = torch.tensor(0.0, device=device)
-        else:
-            losses['mpjpe'] = torch.tensor(0.0, device=device)
 
-        losses['total'] = sum(v for v in losses.values())
+        losses['total'] = sum(v for k, v in losses.items() if k != 'mpjpe_mm')
         return losses
 
     # ------------------------------------------------------------------
@@ -456,15 +455,19 @@ class Splatt3RWithSMPLX(L.LightningModule):
         smplx_losses = self.compute_smplx_loss(smplx_pred, batch)
         loss = smplx_losses['total']
 
-        log = {f'{stage}/loss': loss}
-        for k, v in smplx_losses.items():
-            log[f'{stage}/smplx_{k}'] = v
+        # Build log dict – all keys route through Lightning to WandbLogger.
+        # mpjpe_mm (MPJPE in mm) is the accuracy metric; lower = better.
+        log = {
+            f'{stage}/loss':            loss,
+            f'{stage}/loss_pose':       smplx_losses['pose'],
+            f'{stage}/loss_shape':      smplx_losses['shape'],
+            f'{stage}/loss_expression': smplx_losses['expression'],
+            f'{stage}/loss_transl':     smplx_losses['transl'],
+            f'{stage}/loss_mpjpe':      smplx_losses['mpjpe'],
+            f'{stage}/mpjpe_mm':        smplx_losses['mpjpe_mm'],  # accuracy metric
+        }
 
-        # ---------------------------------------------------------------
-        # Optional: log Gaussian rendering metrics WITHOUT backprop.
-        # This lets us monitor that Gaussian quality hasn't degraded even
-        # though we never update those weights.
-        # ---------------------------------------------------------------
+        # Optional: PSNR on Gaussian renders during validation.
         if stage == 'val' and 'target' in batch:
             with torch.no_grad():
                 _, _, h, w = batch['context'][0]['img'].shape
@@ -693,6 +696,7 @@ def main():
             project='sharingan-splatt3r',
             name=config.run_name,
             save_dir=config.save_dir,
+            log_model=False,
         ))
 
     # Callbacks
