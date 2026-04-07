@@ -40,3 +40,22 @@ loss:
 
 use_offsets: True
 sh_degree: 1
+
+# ========== SMPL-X Configuration ==========
+# Enable SMPL-X head for human body reconstruction
+smplx_enabled: True
+
+# Path to downloaded SMPL-X model (download from https://github.com/vchoutas/smplx)
+# Directory should contain: SMPLX_NEUTRAL.npz, etc.
+smplx_model_path: './models/smplx/SMPLX_NEUTRAL.npz'
+
+# SMPL-X Head Architecture
+smplx_hidden_dim: 512      # Hidden dimension for MLP layers
+smplx_num_layers: 2        # Number of MLP layers in the head
+
+# Loss weights for SMPL-X terms
+lambda_smplx_pose: 1.0        # Weight for pose parameter regression
+lambda_smplx_shape: 0.1       # Weight for shape (beta) parameters
+lambda_smplx_joints: 1.0      # Weight for joint position loss (MPJPE)
+lambda_smplx_expr: 0.1        # Weight for expression coefficients
+lambda_smplx_verts: 0.0       # Weight for per-vertex loss (0 = disabled)
