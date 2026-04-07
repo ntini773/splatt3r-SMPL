@@ -74,6 +74,16 @@ import main as splatt3r_main   # gives us MAST3RGaussians
 import utils.export as export
 import utils.loss_mask as loss_mask
 import utils.compute_ssim as compute_ssim
+import utils.geometry as geometry
+import utils.sh_utils as sh_utils
+
+# New dataset imports
+from data.mvhumannet.mvhumannet import (
+    get_mvhumannet_dataset, 
+    get_mvhumannet_test_dataset, 
+    worker_init_fn, 
+    smplx_collate_fn
+)
 
 
 # ===========================================================================
@@ -105,8 +115,9 @@ class SMPLXHead(nn.Module):
         transl           : (B, 3)
     """
 
-    # Expected decoder token channel dimension for the Splatt3R ViT-Large
-    TOKEN_DIM = 768   # dec_embed_dim from main.py
+    # MASt3R decout is a list where decout[0] is encoder output (1024) 
+    # and decout[-1] is decoder output (768).
+    TOKEN_DIM = 1024 + 768
 
     # Concatenating two views → 2 × TOKEN_DIM input to the MLP
     INPUT_DIM = 2 * TOKEN_DIM
@@ -142,17 +153,20 @@ class SMPLXHead(nn.Module):
         self._sizes = list(self.PARAM_SIZES.values())
         self._keys  = list(self.PARAM_SIZES.keys())
 
-    def _pool_tokens(self, dec_tokens):
+    def _pool_tokens(self, decout):
         """
-        Average-pool a list of decoder token tensors to a single vector.
-
-        dec_tokens is a list of tensors each shaped (B, N, C) as returned by
-        MASt3R's _decoder.  We stack and mean across both list dimension and
-        patch dimension.
+        Average-pool the encoder and decoder token tensors to a single vector.
+        decout is a list returned by MASt3R's _decoder.
+        decout[0] is enc_output (B, N, 1024)
+        decout[-1] is dec_output (B, N, 768)
         """
-        # Stack along a new axis → (B, num_blocks, N, C), then mean over blocks and patches
-        stacked = torch.stack([t for t in dec_tokens], dim=1)  # (B, L, N, C)
-        return stacked.mean(dim=(1, 2))                         # (B, C)
+        enc_output, dec_output = decout[0], decout[-1]
+        
+        # Concatenate along channel dim: (B, N, 1792)
+        cat_output = torch.cat([enc_output, dec_output], dim=-1)
+        
+        # Mean pool over the patch/sequence dimension N: (B, 1792)
+        return cat_output.mean(dim=1)
 
     def forward(self, dec1_tokens, dec2_tokens):
         """
@@ -321,9 +335,27 @@ class Splatt3RWithSMPLX(L.LightningModule):
                 encoder._encode_symmetrized(view1, view2)
             dec1, dec2 = encoder._decoder(feat1, pos1, feat2, pos2)
 
-            # Gaussian predictions (kept for optional rendering loss logging)
+            # Gaussian predictions
             pred1 = encoder._downstream_head(1, [t.float() for t in dec1], shape1)
             pred2 = encoder._downstream_head(2, [t.float() for t in dec2], shape2)
+
+            # --- Gaussian Geometry Postprocessing ---
+            # This mirrors MAST3RGaussians.forward logic to prep parameters for the splat parser
+            pred1['covariances'] = geometry.build_covariance(pred1['scales'], pred1['rotations'])
+            pred2['covariances'] = geometry.build_covariance(pred2['scales'], pred2['rotations'])
+
+            # Spherical Harmonic residuals (using the actual image colors as base)
+            new_sh1 = torch.zeros_like(pred1['sh'])
+            new_sh2 = torch.zeros_like(pred2['sh'])
+            new_sh1[..., 0] = sh_utils.RGB2SH(einops.rearrange(view1['original_img'], 'b c h w -> b h w c'))
+            new_sh2[..., 0] = sh_utils.RGB2SH(einops.rearrange(view2['original_img'], 'b c h w -> b h w c'))
+            pred1['sh'] = pred1['sh'] + new_sh1
+            pred2['sh'] = pred2['sh'] + new_sh2
+
+            # Rename keys for cross-view rendering clarity
+            pred2['pts3d_in_other_view'] = pred2.pop('pts3d')
+            pred2['means_in_other_view'] = pred2.pop('means')
+            # ----------------------------------------
 
         # SMPL-X prediction – this IS in the autograd graph
         smplx_pred = self.smplx_head(
@@ -366,47 +398,53 @@ class Splatt3RWithSMPLX(L.LightningModule):
 
         # 1. Pose losses (all joint groups)
         pose_keys = [
-            ('global_orient', 'smplx_global_orient'),
-            ('body_pose',     'smplx_body_pose'),
-            ('left_hand_pose','smplx_left_hand_pose'),
-            ('right_hand_pose','smplx_right_hand_pose'),
-            ('jaw_pose',      'smplx_jaw_pose'),
-            ('leye_pose',     'smplx_leye_pose'),
-            ('reye_pose',     'smplx_reye_pose'),
+            ('global_orient', 'global_orient'),
+            ('body_pose',     'body_pose'),
+            ('left_hand_pose','left_hand_pose'),
+            ('right_hand_pose','right_hand_pose'),
+            ('jaw_pose',      'jaw_pose'),
+            ('leye_pose',     'leye_pose'),
+            ('reye_pose',     'reye_pose'),
         ]
         pose_loss = torch.tensor(0.0, device=device)
-        for pred_key, batch_key in pose_keys:
-            if batch_key in batch:
-                pose_loss = pose_loss + F.mse_loss(smplx_pred[pred_key], batch[batch_key])
+        if 'smplx' in batch:
+            for pred_key, smpl_key in pose_keys:
+                if smpl_key in batch['smplx']:
+                    target = batch['smplx'][smpl_key]
+                    pose_loss = pose_loss + F.mse_loss(smplx_pred[pred_key], target)
         losses['pose'] = self.lambda_pose * pose_loss
 
         # 2. Shape loss
-        if 'smplx_betas' in batch:
+        if 'smplx' in batch and 'betas' in batch['smplx']:
             losses['shape'] = self.lambda_shape * F.mse_loss(
-                smplx_pred['betas'], batch['smplx_betas'])
+                smplx_pred['betas'], batch['smplx']['betas'])
         else:
             losses['shape'] = torch.tensor(0.0, device=device)
 
         # 3. Expression loss
-        if 'smplx_expression' in batch:
+        if 'smplx' in batch and 'expression' in batch['smplx']:
             losses['expression'] = self.lambda_expr * F.mse_loss(
-                smplx_pred['expression'], batch['smplx_expression'])
+                smplx_pred['expression'], batch['smplx']['expression'])
         else:
             losses['expression'] = torch.tensor(0.0, device=device)
 
         # 4. Translation loss
-        if 'smplx_transl' in batch:
+        if 'smplx' in batch and 'transl' in batch['smplx']:
             losses['transl'] = self.lambda_transl * F.mse_loss(
-                smplx_pred['transl'], batch['smplx_transl'])
+                smplx_pred['transl'], batch['smplx']['transl'])
         else:
             losses['transl'] = torch.tensor(0.0, device=device)
 
         # 5. MPJPE via SMPL-X body model forward pass
         losses['mpjpe'] = torch.tensor(0.0, device=device)
-        losses['mpjpe_mm'] = torch.tensor(0.0, device=device)  # unweighted mm, logged as accuracy
+        losses['mpjpe_mm'] = torch.tensor(0.0, device=device)
 
-        if self.smplx_body_model is not None and self.lambda_joints > 0 and 'smplx_betas' in batch:
+        if (self.smplx_body_model is not None and 
+            self.lambda_joints > 0 and 
+            'smplx' in batch and 
+            'betas' in batch['smplx']):
             try:
+                # Prediction forward pass
                 out_pred = self.smplx_body_model(
                     betas=smplx_pred['betas'],
                     expression=smplx_pred['expression'],
@@ -420,17 +458,20 @@ class Splatt3RWithSMPLX(L.LightningModule):
                     transl=smplx_pred['transl'],
                     return_verts=False,
                 )
+                
+                # Ground truth forward pass
+                targets = batch['smplx']
                 out_gt = self.smplx_body_model(
-                    betas=batch['smplx_betas'],
-                    expression=batch['smplx_expression'],
-                    global_orient=batch['smplx_global_orient'],
-                    body_pose=batch['smplx_body_pose'],
-                    left_hand_pose=batch['smplx_left_hand_pose'],
-                    right_hand_pose=batch['smplx_right_hand_pose'],
-                    jaw_pose=batch['smplx_jaw_pose'],
-                    leye_pose=batch['smplx_leye_pose'],
-                    reye_pose=batch['smplx_reye_pose'],
-                    transl=batch['smplx_transl'],
+                    betas=targets['betas'],
+                    expression=targets['expression'],
+                    global_orient=targets['global_orient'],
+                    body_pose=targets['body_pose'],
+                    left_hand_pose=targets['left_hand_pose'],
+                    right_hand_pose=targets['right_hand_pose'],
+                    jaw_pose=targets['jaw_pose'],
+                    leye_pose=targets['leye_pose'],
+                    reye_pose=targets['reye_pose'],
+                    transl=targets['transl'],
                     return_verts=False,
                 )
                 pred_j = out_pred.joints[:, :22, :]
@@ -467,7 +508,7 @@ class Splatt3RWithSMPLX(L.LightningModule):
             f'{stage}/mpjpe_mm':        smplx_losses['mpjpe_mm'],  # accuracy metric
         }
 
-        # Optional: PSNR on Gaussian renders during validation.
+        # Optional rendering: we can now safely decode Gaussians because we ran the postprocessor!
         if stage == 'val' and 'target' in batch:
             with torch.no_grad():
                 _, _, h, w = batch['context'][0]['img'].shape
@@ -540,60 +581,6 @@ class Splatt3RWithSMPLX(L.LightningModule):
 
 
 # ===========================================================================
-# Dataset placeholder – replace with real MV-HumanPlus++ loader
-# ===========================================================================
-
-class MVHumanPlusPlusDataset(torch.utils.data.Dataset):
-    """
-    Minimal interface for the MV-HumanPlus++ dataset.
-
-    WHY NOT SCANNET++?
-    ------------------
-    The original train script used ScanNet++ which contains indoor scenes,
-    NOT humans, and has no SMPL/SMPL-X annotations.  MV-HumanPlus++ was
-    specifically chosen because it provides:
-      - Multi-view RGB frames of humans in various poses/clothing
-      - Per-frame SMPL-X parameter annotations
-      - Camera intrinsics / extrinsics per view
-
-    Expected __getitem__ output (dict):
-        context : list of two view dicts, each with keys:
-                    'img'          : (3, H, W) normalised tensor
-                    'original_img' : (3, H, W) [0,1] tensor
-                    'true_shape'   : (2,) int tensor [H, W]
-                    'camera_pose'  : (4, 4) float tensor
-                    'camera_intrinsics': (3, 3) float tensor
-        target  : list of target view dicts (same structure as context views)
-        smplx_betas           : (10,)
-        smplx_global_orient   : (3,)
-        smplx_body_pose       : (63,)
-        smplx_left_hand_pose  : (45,)
-        smplx_right_hand_pose : (45,)
-        smplx_jaw_pose        : (3,)
-        smplx_leye_pose       : (3,)
-        smplx_reye_pose       : (3,)
-        smplx_expression      : (10,)
-        smplx_transl          : (3,)
-    """
-
-    def __init__(self, root, split='train', resolution=(512, 512)):
-        self.root       = root
-        self.split      = split
-        self.resolution = resolution
-        # TODO: build self.samples index from MV-HumanPlus++ directory structure
-        raise NotImplementedError(
-            "MVHumanPlusPlusDataset is a stub. "
-            "Implement __len__ and __getitem__ for your data layout."
-        )
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        raise NotImplementedError
-
-
-# ===========================================================================
 # Config dataclass
 # ===========================================================================
 
@@ -601,22 +588,25 @@ class Config:
     # ---- Paths ----
     # Path to a Splatt3R Lightning checkpoint (.ckpt), e.g. downloaded via
     # hf_hub_download as shown in demo.py.
-    splatt3r_checkpoint_path: str = './checkpoints/epoch=19-step=1200.ckpt'
+    splatt3r_checkpoint_path: str = f"/ssd_scratch/gnrs/checkpoints/epoch=19-step=1200.ckpt"
+    # splatt3r_checkpoint_path: str = ''
 
     # Path to the SMPL-X model directory (contains smplx/SMPLX_NEUTRAL.npz etc.)
-    smplx_model_path: str = './smplx_models'
+    smplx_model_path: str = '/ssd_scratch/gnrs/checkpoints/'
 
     # MV-HumanPlus++ root directory
-    data_root: str = '/data/mv_human_plus_plus'
+    data_root: str = '/ssd_scratch/gnrs/mvhumannet++_10demo/main'
+    depth_root: str = '/ssd_scratch/gnrs/mvhumannet++_10demo/depth'
 
     # ---- Training ----
-    epochs:     int   = 50
-    batch_size: int   = 8       # fits in 12 GB per GPU with frozen backbone
+    epochs:     int   = 2
+    batch_size: int   = 2       # Small batch size for testing
     num_workers: int  = 4
-    lr:          float = 1e-3   # high LR OK because we only train a small head
+    lr:          float = 1e-3   
     weight_decay: float = 0.01
     gradient_clip_val: float = 1.0
     resolution: tuple = (512, 512)
+
 
     # ---- Head architecture ----
     smplx_hidden_dim: int   = 512
@@ -636,7 +626,8 @@ class Config:
     unfreeze_gaussian_heads: bool = False
 
     # ---- Infrastructure ----
-    devices:   list  = None   # e.g. [0,1,2,3] – defaults to all available GPUs
+    devices:   list  = [0]    # Test on a single GPU first
+
     save_dir:  str   = './runs/smplx_head'
     run_name:  str   = 'smplx_head_v1'
     use_wandb: bool  = True
@@ -663,10 +654,24 @@ def main():
     L.seed_everything(config.seed, workers=True)
 
     # Build datasets
-    train_dataset = MVHumanPlusPlusDataset(
-        config.data_root, split='train', resolution=config.resolution)
-    val_dataset   = MVHumanPlusPlusDataset(
-        config.data_root, split='val',   resolution=config.resolution)
+    train_dataset = get_mvhumannet_dataset(
+        main_root=config.data_root,
+        depth_root=config.depth_root,
+        resolution=config.resolution,
+        num_epochs_per_epoch=getattr(config, 'epochs_per_train_epoch', 1),
+    )
+    # Validation uses get_mvhumannet_test_dataset with a fixed set of samples.
+    # Replace `val_samples` with your actual list of testing tuples.
+    val_samples = [
+        ('100831', 'cam_00', 'cam_08', 'cam_04', '0025'),
+        ('100832', 'cam_00', 'cam_08', 'cam_04', '0025'),
+    ]
+    val_dataset = get_mvhumannet_test_dataset(
+        main_root=config.data_root,
+        depth_root=config.depth_root,
+        resolution=config.resolution,
+        samples=val_samples,
+    )
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -674,6 +679,8 @@ def main():
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=True,
+        collate_fn=smplx_collate_fn,
+        worker_init_fn=worker_init_fn,
     )
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
@@ -681,6 +688,8 @@ def main():
         shuffle=False,
         num_workers=config.num_workers,
         pin_memory=True,
+        collate_fn=smplx_collate_fn,
+        worker_init_fn=worker_init_fn,
     )
 
     # Build model
@@ -703,14 +712,14 @@ def main():
     callbacks = [
         L.pytorch.callbacks.ModelCheckpoint(
             dirpath=os.path.join(config.save_dir, config.run_name),
-            filename='smplx_head-{epoch:02d}-{val/smplx_total:.4f}',
-            monitor='val/smplx_total',
+            filename='smplx_head-{epoch:02d}-{val/loss:.4f}',
+            monitor='val/loss',
             save_top_k=3,
             mode='min',
         ),
         L.pytorch.callbacks.LearningRateMonitor(logging_interval='epoch'),
         L.pytorch.callbacks.EarlyStopping(
-            monitor='val/smplx_total',
+            monitor='val/loss',
             patience=10,
             mode='min',
         ),

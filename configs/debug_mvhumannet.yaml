@@ -1,0 +1,22 @@
+include: ['main.yaml']
+
+save_dir: './results/debug_mvhumannet/${name}/'
+
+devices: [0]
+
+loggers:
+  use_wandb: False
+
+data:
+  main_root:  '/ssd_scratch/gnrs/mvhumannet++_10demo/main'   # update to your actual path
+  depth_root: '/ssd_scratch/gnrs/mvhumannet++_10demo/depth'  # can differ from main_root
+  # sequences: null means auto-discover all sequences under main_root
+  # set to a list to restrict, e.g: ['100831', '100832']
+  sequences: null
+  batch_size: 2
+  num_workers: 4
+  resolution: [512, 512]
+  epochs_per_train_epoch: 10
+
+opt:
+  epochs: 1
