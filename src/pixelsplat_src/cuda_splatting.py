@@ -221,6 +221,96 @@ def render_cuda_orthographic(
 DepthRenderingMode = Literal["depth", "disparity", "relative_disparity", "log"]
 
 
+def quaternion_to_surface_normal(quaternions: Tensor) -> Tensor:
+    """
+    Extracts the surface normal (shortest axis / local Z) from each Gaussian's
+    rotation quaternion using the standard quaternion-to-rotation formula.
+
+    WHY THIS IS THE NORMAL
+    ----------------------
+    A 3D Gaussian is an ellipsoid. Its "surface" at any point faces along the
+    axis that has the smallest scale (the most disc-like direction). By convention
+    in Gaussian Splatting, this is the local Z axis after applying the quaternion
+    rotation. The third column of the rotation matrix gives this direction in
+    world space.
+
+    Args:
+        quaternions: [..., 4] tensor in (qw, qx, qy, qz) order.
+
+    Returns:
+        normals: [..., 3] unit vectors in world space.
+    """
+    qw, qx, qy, qz = quaternions.unbind(-1)
+    # Third column of rotation matrix from quaternion:
+    nx = 2 * (qx * qz + qw * qy)
+    ny = 2 * (qy * qz - qw * qx)
+    nz = 1 - 2 * (qx ** 2 + qy ** 2)
+    return torch.stack([nx, ny, nz], dim=-1)  # [..., 3], already unit length
+
+
+def render_normals_cuda(
+    extrinsics,
+    intrinsics,
+    near,
+    far,
+    image_shape: tuple[int, int],
+    gaussian_means,
+    gaussian_covariances,
+    gaussian_opacities,
+    gaussian_quaternions,
+    scale_invariant: bool = True,
+) -> Tensor:
+    """
+    Renders a per-pixel surface normal map by alpha-compositing per-Gaussian
+    normals using the same CUDA rasterizer as RGB rendering.
+
+    HOW IT WORKS
+    ------------
+    The `colors_precomp` argument of GaussianRasterizer accepts a raw [G, 3]
+    tensor that bypasses SH evaluation entirely. Since normals are already
+    3-vectors (nx, ny, nz), we pass them directly as `colors_precomp`.
+    The kernel alpha-composites them identically to RGB — the output pixel
+    value is the opacity-weighted average normal of all Gaussians covering
+    that pixel, which is the standard definition of a rendered normal map.
+
+    SH colors cannot be used here because the SH evaluation shader treats
+    the coefficients as view-dependent color harmonics — meaningless for normals.
+
+    Args:
+        gaussian_quaternions: [B, G, 4] rotation quaternions (qw, qx, qy, qz)
+
+    Returns:
+        normal_map: [B, 3, H, W], values in [-1, 1], L2-normalised per pixel.
+    """
+    # Derive per-Gaussian surface normals from their rotation quaternions.
+    # Shape: [B, G, 3]
+    normals_per_gaussian = quaternion_to_surface_normal(gaussian_quaternions)
+
+    # Fake SH: wrap the [B, G, 3] normals into the [B, G, 3, 1] shape that
+    # render_cuda expects for `gaussian_sh_coefficients` (degree-0 = constant color).
+    fake_sh = normals_per_gaussian.unsqueeze(-1)  # [B, G, 3, 1]
+
+    normal_map = render_cuda(
+        extrinsics,
+        intrinsics,
+        near,
+        far,
+        image_shape,
+        # Black background for normals (background pixels → [0, 0, 0])
+        torch.zeros((extrinsics.shape[0], 3), dtype=normals_per_gaussian.dtype, device=normals_per_gaussian.device),
+        gaussian_means,
+        gaussian_covariances,
+        fake_sh,
+        gaussian_opacities,
+        scale_invariant=scale_invariant,
+        use_sh=False,  # <-- Critical: bypass SH evaluation, use colors_precomp
+    )  # [B, 3, H, W]
+
+    # L2-normalise per-pixel so the rendered normals are proper unit vectors.
+    normal_map = torch.nn.functional.normalize(normal_map, dim=1, eps=1e-8)
+    return normal_map
+
+
 def render_depth_cuda(
     extrinsics,
     intrinsics,

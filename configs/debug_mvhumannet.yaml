@@ -2,21 +2,31 @@ include: ['main.yaml']
 
 save_dir: './results/debug_mvhumannet/${name}/'
 
-devices: [0]
+# Fast Debugging Checkpoint path
+splatt3r_checkpoint_path: '/ssd_scratch/gnrs/checkpoints/epoch=19-step=1200.ckpt'
+
+devices: 'auto'
 
 loggers:
-  use_wandb: False
+  use_wandb: False    # Keep WandB off to avoid cluttering your dashboard during tests
+  use_csv_logger: True # Local CSV and Tensorboard will still be created
 
 data:
-  main_root:  '/ssd_scratch/gnrs/mvhumannet++_10demo/main'   # update to your actual path
-  depth_root: '/ssd_scratch/gnrs/mvhumannet++_10demo/depth'  # can differ from main_root
-  # sequences: null means auto-discover all sequences under main_root
-  # set to a list to restrict, e.g: ['100831', '100832']
+  root: '/ssd_scratch/gnrs/mvhumannet++_10demo'
   sequences: null
   batch_size: 2
   num_workers: 4
   resolution: [512, 512]
-  epochs_per_train_epoch: 10
+  
+  # DEBUG SCALE: Only repeat the dataset 2 times per epoch (instead of 10 or 100)
+  # This makes '1 epoch' finish extremely fast so you can see summary logs.
+  epochs_per_train_epoch: 2
 
 opt:
+  # Debug scale: just 3 epochs
   epochs: 1
+  accumulate_grad_batches : 4
+
+loss:
+  # Enable normal loss during debug
+  normal_loss_weight: 0.1

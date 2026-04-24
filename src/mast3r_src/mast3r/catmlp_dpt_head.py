@@ -241,15 +241,31 @@ class GaussianHead(PixelwiseTaskWithDPT):
         self.use_offsets = use_offsets
         self.sh_degree = sh_degree
 
+        # @MODIFIED: Prior attention for Anatomical Features
+        self.prior_attention = torch.nn.MultiheadAttention(embed_dim=net.dec_embed_dim, kdim=32, vdim=32, num_heads=4, batch_first=True)
+        self.norm = torch.nn.LayerNorm(net.dec_embed_dim)
+        
+        # Zero-initialize the output projection to ensure the DPT head starts with its 
+        # original pretrained behavior at Step 0 and slowly learns to trust the prior.
+        torch.nn.init.zeros_(self.prior_attention.out_proj.weight)
+        torch.nn.init.zeros_(self.prior_attention.out_proj.bias)
 
-    def forward(self, decout, img_shape):
+    def forward(self, decout, img_shape, human_prior_features=None):
+        def _get_dim(v):
+            if isinstance(v, torch.Tensor):
+                return int(v.flatten()[0].item())
+            elif isinstance(v, (list, tuple)):
+                return int(v[0])
+            return int(v)
+            
+        H, W = _get_dim(img_shape[0]), _get_dim(img_shape[1])
+        
         # pass through the heads
-        pts3d = self.dpt(decout, image_size=(img_shape[0], img_shape[1]))
+        pts3d = self.dpt(decout, image_size=(H, W))
 
         # recover encoder and decoder outputs
         enc_output, dec_output = decout[0], decout[-1]
         cat_output = torch.cat([enc_output, dec_output], dim=-1)  # concatenate
-        H, W = img_shape
         B, S, D = cat_output.shape
 
         # extract local_features
@@ -258,7 +274,16 @@ class GaussianHead(PixelwiseTaskWithDPT):
         local_features = F.pixel_shuffle(local_features, self.patch_size)  # B,d,H,W
 
         # extract gaussian_features
-        gaussian_features = self.gaussian_dpt.dpt(decout, image_size=(img_shape[0], img_shape[1]))
+        new_decout = list(decout)
+        if human_prior_features is not None:
+            attended_priors, _ = self.prior_attention(
+                query=new_decout[-1],
+                key=human_prior_features,
+                value=human_prior_features
+            )
+            new_decout[-1] = self.norm(new_decout[-1] + attended_priors)
+
+        gaussian_features = self.gaussian_dpt.dpt(new_decout, image_size=(H, W))
         # gaussian_features = self.gaussian_local_features(cat_output)  # B,S,D
         # gaussian_features = gaussian_features.transpose(-1, -2).view(B, -1, H // self.patch_size, W // self.patch_size)
         # gaussian_features = F.pixel_shuffle(gaussian_features, self.patch_size)  # B,d,H,W

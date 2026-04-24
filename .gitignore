@@ -3,3 +3,5 @@ __pycache__/*
 .gradio
 checkpoints/
 runs/
+results/
+lightning_logs/
