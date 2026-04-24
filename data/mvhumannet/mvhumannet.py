@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 NUM_CAMERAS = 16
 ALL_CAMERA_IDS = [f"cam_{i:02d}" for i in range(NUM_CAMERAS)]
 NUM_CONTEXT_VIEWS = 2
-NUM_TARGET_VIEWS = 1
+NUM_TARGET_VIEWS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -296,10 +296,17 @@ class MVHumanNetSplattingDataset(torch.utils.data.Dataset):
         seq, frame_name = self.index[idx]
 
         # ── Camera sampling ───────────────────────────────────────────────────
-        cam_order    = random.sample(ALL_CAMERA_IDS, len(ALL_CAMERA_IDS))
-        context_cams = cam_order[:self.num_context_views]
-        target_cams  = cam_order[self.num_context_views:
-                                  self.num_context_views + self.num_target_views]
+        # Use localized circular sampling based on user heuristic:
+        # Context: [i, i+2]
+        # Target:  [i-1, i+1, i+3]
+        i = random.randint(0, NUM_CAMERAS - 1)
+        context_indices = [i, (i + 2) % NUM_CAMERAS][:self.num_context_views]
+        
+        # User requested i-1, i+1, i+3 (assuming i+1, i+1 was a typo for i+3 to perfectly interleave)
+        target_indices  = [(i - 1) % NUM_CAMERAS, (i + 1) % NUM_CAMERAS, (i + 3) % NUM_CAMERAS][:self.num_target_views]
+        
+        context_cams = [f"cam_{c:02d}" for c in context_indices]
+        target_cams  = [f"cam_{t:02d}" for t in target_indices]
 
         views = {'context': [], 'target': [], 'scene': seq}
 

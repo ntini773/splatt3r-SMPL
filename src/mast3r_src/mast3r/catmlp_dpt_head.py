@@ -243,10 +243,11 @@ class GaussianHead(PixelwiseTaskWithDPT):
 
         # @MODIFIED: Prior attention for Anatomical Features
         self.prior_attention = torch.nn.MultiheadAttention(embed_dim=net.dec_embed_dim, kdim=32, vdim=32, num_heads=4, batch_first=True)
-        self.norm = torch.nn.LayerNorm(net.dec_embed_dim)
+        # We specifically do NOT use LayerNorm here. Normalizing the pretrained token stream 
+        # would instantly destroy the pretrained feature distributions.
         
-        # Zero-initialize the output projection to ensure the DPT head starts with its 
-        # original pretrained behavior at Step 0 and slowly learns to trust the prior.
+        # Zero-initialize the output projection (ControlNet-style) to ensure the DPT head 
+        # starts with its exact original pretrained behavior at Step 0.
         torch.nn.init.zeros_(self.prior_attention.out_proj.weight)
         torch.nn.init.zeros_(self.prior_attention.out_proj.bias)
 
@@ -281,7 +282,8 @@ class GaussianHead(PixelwiseTaskWithDPT):
                 key=human_prior_features,
                 value=human_prior_features
             )
-            new_decout[-1] = self.norm(new_decout[-1] + attended_priors)
+            # Add directly without LayerNorm to preserve exact Step 0 identity
+            new_decout[-1] = new_decout[-1] + attended_priors
 
         gaussian_features = self.gaussian_dpt.dpt(new_decout, image_size=(H, W))
         # gaussian_features = self.gaussian_local_features(cat_output)  # B,S,D

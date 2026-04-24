@@ -6,7 +6,7 @@
 include: ['main.yaml']
 
 # Define custom save folder for finetuning results
-save_dir: './results/finetune_anatomical/${name}/'
+save_dir: '/ssd_scratch/gnrs/results_finetune_anatomical/${name}/'
 
 # Checkpoint from base Splatt3R to initialize the DPT heads & PixelSplat decoder
 # IMPORTANT: Provide the full absolute path to the .ckpt file!
@@ -27,12 +27,12 @@ data:
   sequences: null
   
   resolution: [512, 512]
-  batch_size: 4           # Increase if your multi-GPU setup has VRAM overhead
+  batch_size: 2          # Increase if your multi-GPU setup has VRAM overhead
   num_workers: 8          # Match CPUS per GPU
   
   # How many loops over the small dataset per 1 logical "epoch". 
   # Helps avoid PyTorch Lightning overhead for tiny datasets.
-  epochs_per_train_epoch: 10 
+  epochs_per_train_epoch: 20
 
 opt:
   # For cross-attention refinement from scratch, 20-30 epochs is usually optimal.

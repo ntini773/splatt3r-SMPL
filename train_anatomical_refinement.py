@@ -85,8 +85,6 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
         self.encoder.downstream_head2.gaussian_dpt.dpt.requires_grad_(True)
         self.encoder.downstream_head1.prior_attention.requires_grad_(True)
         self.encoder.downstream_head2.prior_attention.requires_grad_(True)
-        self.encoder.downstream_head1.norm.requires_grad_(True)
-        self.encoder.downstream_head2.norm.requires_grad_(True)
 
         # ------------------------------------------------------------------
         # 4. Initialise the new GCN encoder (will be trained from scratch).
@@ -363,9 +361,7 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
         gcn_and_attn_params = (
             list(self.gcn_encoder.parameters()) +
             list(self.encoder.downstream_head1.prior_attention.parameters()) +
-            list(self.encoder.downstream_head2.prior_attention.parameters()) +
-            list(self.encoder.downstream_head1.norm.parameters()) +
-            list(self.encoder.downstream_head2.norm.parameters())
+            list(self.encoder.downstream_head2.prior_attention.parameters())
         )
         dpt_params = (
             list(self.encoder.downstream_head1.gaussian_dpt.dpt.parameters()) +
@@ -425,6 +421,23 @@ def run_dist_experiment(config):
         num_workers=config.data.num_workers, pin_memory=True,
     )
 
+    # -----------------------------------------------------------------------
+    # Setup Loggers
+    # -----------------------------------------------------------------------
+    loggers = []
+    log_cfg = getattr(config, 'loggers', {})
+    
+    if getattr(log_cfg, 'use_csv_logger', True):
+        loggers.append(L.pytorch.loggers.CSVLogger(save_dir=config.save_dir, name=config.name))
+        
+    if getattr(log_cfg, 'use_wandb', False):
+        loggers.append(L.pytorch.loggers.WandbLogger(
+            project='splatt3r-gcn',
+            name=config.name,
+            save_dir=config.save_dir,
+            log_model=False,
+        ))
+
     trainer = L.Trainer(
         accelerator="gpu",
         devices=config.devices,
@@ -432,6 +445,8 @@ def run_dist_experiment(config):
         benchmark=True,
         log_every_n_steps=10,
         max_epochs=config.opt.epochs,
+        logger=loggers,
+        default_root_dir=config.save_dir,
         accumulate_grad_batches=getattr(config.opt, 'accumulate_grad_batches', 1),
         gradient_clip_val=getattr(config.opt, 'gradient_clip_val', 1.0),
         callbacks=[
