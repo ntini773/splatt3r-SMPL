@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 NUM_CAMERAS = 16
 ALL_CAMERA_IDS = [f"cam_{i:02d}" for i in range(NUM_CAMERAS)]
 NUM_CONTEXT_VIEWS = 2
-NUM_TARGET_VIEWS = 3
+NUM_TARGET_VIEWS = 1
 
 
 # ---------------------------------------------------------------------------

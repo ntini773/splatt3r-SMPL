@@ -291,7 +291,7 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
             if v < num_context:
                 img_list.append(batch['context'][v]['original_img'][b].detach().cpu().clamp(0, 1))
             else:
-                img_list.append(torch.zeros_like(target_color[b, v]))
+                img_list.append(torch.zeros_like(target_color[b, v]).cpu())
                 
         # Helper extraction functions
         def get_rgb(tensor, v):
@@ -318,7 +318,7 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
             if gt_normals is not None:
                 img_list.append(get_masked_norm(gt_normals, dataset_human_mask, v))
             else:
-                img_list.append(torch.zeros_like(rendered_normals[b, v]))
+                img_list.append(torch.zeros_like(rendered_normals[b, v]).cpu())
                 
         # Row 4: Predicted Normal (Masked to body)
         for v in range(V_tgt): img_list.append(get_masked_norm(rendered_normals, dataset_human_mask, v))
