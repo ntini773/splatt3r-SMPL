@@ -189,11 +189,13 @@ class MVHumanNetAnatomicalData(MVHumanNetData):
         Load precomputed posed SMPL-X anchors from anchors/{seq}/{frame_name}.npz
         NPZ key expected: 'anchors'  shape [512, 3] float32
         """
+        Rot_mat = np.array([[1, 0, 0], [0, -1, 0], [0, 0, 1]], dtype=np.float32)
         anchor_path = os.path.join(self.anchor_root, seq, f'{frame_name}.npz')
         if not os.path.exists(anchor_path):
             raise FileNotFoundError(f"Strict Check: Anchor file missing at {anchor_path}. Model requires valid human prior anchors dataset.")
             
-        return np.load(anchor_path)['anchors'].astype(np.float32)  # key='anchors'
+        anchors = np.load(anchor_path)['anchors'].astype(np.float32)  # key='anchors'
+        return anchors @ Rot_mat.T  # Apply rotation to align with the canonical coordinate system
 
     def get_mask(self, seq, cam_id, frame_name, resolution):
         """

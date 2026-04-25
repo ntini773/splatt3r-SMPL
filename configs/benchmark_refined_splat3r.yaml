@@ -1,0 +1,52 @@
+# ==========================================================
+# Refined Splatt3R Benchmark Configuration
+# ==========================================================
+# Evaluates the anatomical-refined model checkpoint using
+# the same 2-context / 3-target metric+visualization protocol.
+include: ['main.yaml']
+run_name: 'benchmark_refined_splat3r_evaluation'
+
+# Optional training workspace output path inherited by some utilities.
+save_dir: '/ssd_scratch/gnrs/results_finetune_anatomical/${name}/'
+
+# Base Splatt3R checkpoint used to construct MAST3RAnatomicalRefinement.
+# This must match the backbone family used during refinement training.
+splatt3r_checkpoint_path: '/ssd_scratch/gnrs/checkpoints/epoch=19-step=1200.ckpt'
+
+# Refined anatomical checkpoint (produced by train_anatomical_refinement.py).
+# Update this path to your latest generated checkpoint.
+refined_checkpoint_path: '/ssd_scratch/gnrs/gcn_checkpoints/anatomical-epoch=21-train/loss=0.3257.ckpt'
+
+# Output directory used by refined_splatt3r_benchmark.py
+# Saved files: results.json, metrics.txt, visualizations/*.jpg
+eval_save_dir: '/ssd_scratch/gnrs/refined_splatt3r_eval_results'
+
+# Keep logger settings consistent with your existing benchmark setup.
+loggers:
+  use_wandb: True
+  use_csv_logger: True
+
+data:
+  root: '/ssd_scratch/gnrs/mvhumannet++_10demo'
+
+  # null means auto-discover all sequences in root/main/
+  # or provide a subset list
+  sequences: ['100839', '100840']
+
+  resolution: [512, 512]
+  batch_size: 2
+  num_workers: 8
+  epochs_per_train_epoch: 1
+
+opt:
+  epochs: 1
+  lr: 0.00002
+  accumulate_grad_batches: 1
+
+loss:
+  mse_loss_weight: 1.0
+  lpips_loss_weight: 2.0
+  normal_loss_weight: 0.1
+  background_weight: 0.1
+  apply_mask: True
+  average_over_mask: True

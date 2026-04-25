@@ -431,12 +431,18 @@ def run_dist_experiment(config):
         loggers.append(L.pytorch.loggers.CSVLogger(save_dir=config.save_dir, name=config.name))
         
     if getattr(log_cfg, 'use_wandb', False):
-        loggers.append(L.pytorch.loggers.WandbLogger(
+        run_name = getattr(config, 'run_name', None) or getattr(config, 'name', None)
+        wandb_logger = L.pytorch.loggers.WandbLogger(
             project='splatt3r-gcn',
-            name=config.name,
+            name=run_name,
             save_dir=config.save_dir,
             log_model=False,
-        ))
+        )
+        # Force the display name on the active run as some W&B/Lightning
+        # combinations can ignore logger name during distributed init.
+        if run_name and wandb_logger.experiment is not None:
+            wandb_logger.experiment.name = run_name
+        loggers.append(wandb_logger)
 
     trainer = L.Trainer(
         accelerator="gpu",
