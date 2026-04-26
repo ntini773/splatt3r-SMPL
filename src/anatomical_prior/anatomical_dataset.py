@@ -275,7 +275,11 @@ class MVHumanNetAnatomicalDataset(torch.utils.data.Dataset):
                                   self.num_context_views + self.num_target_views]
 
         # Load mesh anchors ONCE per frame (same across all cameras for the same frame)
-        anchors = self.data.get_anchors(seq, frame_name)  # [512, 3]
+        anchors = self.data.get_anchors(seq, frame_name).astype(np.float32)  # [512, 3]
+        R = np.array([[1, 0, 0],
+                  [0, -1, 0],
+                  [0, 0, 1]], dtype=np.float32)
+        anchors = anchors @ R.T  # Convert from SMPL-X world space to camera space
 
         views = {'context': [], 'target': [], 'scene': seq, 'smpl_adj': self.adj}
 

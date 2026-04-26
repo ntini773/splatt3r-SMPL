@@ -1,0 +1,55 @@
+# ==========================================================
+# Anatomical Refinement Fine-Tuning Configuration
+# ==========================================================
+# Inherits the heavy Splatt3R baseline settings, but overrides 
+# parameters specific to GCN cross-attention fine-tuning.
+include: ['main.yaml']
+
+# Define custom save folder for finetuning results
+save_dir: '/ssd_scratch/adityapeketi/results_finetune_anatomical/${name}/'
+
+# Checkpoint from base Splatt3R to initialize the DPT heads & PixelSplat decoder
+# IMPORTANT: Provide the full absolute path to the .ckpt file!
+splatt3r_checkpoint_path: '/ssd_scratch/adityapeketi/checkpoints/epoch=19-step=1200.ckpt'
+
+# Loggers — Turn on wandb for full production runs
+loggers:
+  use_wandb: True
+  use_csv_logger: True
+
+data:
+  # Base dataset root containing 'main/', 'depth/', 'normal/', 'anchors/'
+  root: '/ssd_scratch/adityapeketi/mvhumannet++_10demo'
+  
+  # Sequences:
+  # - null means auto-discover all sequences inside root/main/
+  # - or supply a list like ['100831', '100832']
+  sequences: null
+  
+  resolution: [512, 512]
+  batch_size: 2          # Increase if your multi-GPU setup has VRAM overhead
+  num_workers: 8          # Match CPUS per GPU
+  
+  # How many loops over the small dataset per 1 logical "epoch". 
+  # Helps avoid PyTorch Lightning overhead for tiny datasets.
+  epochs_per_train_epoch: 8
+
+opt:
+  # For cross-attention refinement from scratch, 20-30 epochs is usually optimal.
+  epochs: 10
+  
+  # Base LR. (Remember: Gaussian DPT automatically uses 0.1x of this!)
+  lr: 0.00002
+  accumulate_grad_batches : 2
+
+loss:
+  mse_loss_weight: 0.5
+  lpips_loss_weight: 1.0
+  
+  # Brand new Normal Consistency Loss weight!
+  normal_loss_weight: 0.1
+  
+  # Softly penalize background, but strongly penalize the human 
+  background_weight: 0.1
+  apply_mask: True
+  average_over_mask: True
