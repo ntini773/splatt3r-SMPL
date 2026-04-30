@@ -1,4 +1,5 @@
 import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:128'
 import sys
 import torch
 import einops
@@ -52,6 +53,8 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        # background_weight scheduling state (updated in on_train_epoch_start)
+        self._current_bg_weight = getattr(config.loss, 'background_weight', 0.1)
 
         # ------------------------------------------------------------------
         # 1. Load the full Splatt3R model via Lightning API so that ALL sub-
@@ -129,6 +132,10 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
             [tok.float() for tok in dec2], shape2, human_prior_features=prior2
         )
 
+        # Clamp scales to prevent Gaussian blowup (which causes massive tile overlap and OOMs)
+        pred1['scales'] = torch.clamp(pred1['scales'], max=0.05)
+        pred2['scales'] = torch.clamp(pred2['scales'], max=0.05)
+
         pred1['covariances'] = geometry.build_covariance(pred1['scales'], pred1['rotations'])
         pred2['covariances'] = geometry.build_covariance(pred2['scales'], pred2['rotations'])
 
@@ -144,6 +151,34 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
         pred2['means_in_other_view'] = pred2.pop('means')
 
         return pred1, pred2
+
+    def on_train_epoch_start(self):
+        """Update background_weight according to linear decay schedule."""
+        loss_cfg = self.config.loss
+        initial_bg  = getattr(loss_cfg, 'background_weight', 0.1)
+        end_epoch   = getattr(loss_cfg, 'bg_schedule_end_epoch', None)
+        psnr_gate   = getattr(loss_cfg, 'bg_schedule_psnr_gate', None)
+
+        if end_epoch is None or self.current_epoch == 0:
+            # No schedule configured, or not started yet
+            self._current_bg_weight = initial_bg
+        else:
+            # Optionally gate: don't start decaying until PSNR reaches threshold
+            psnr_ok = True
+            if psnr_gate is not None:
+                logged_psnr = self.trainer.logged_metrics.get('train/psnr', None)
+                psnr_ok = (logged_psnr is not None) and (logged_psnr >= psnr_gate)
+
+            if psnr_ok:
+                # Linear decay: initial_bg → floor over [0, end_epoch]
+                floor = getattr(loss_cfg, 'bg_weight_floor', 0.05)
+                fraction = min(1.0, self.current_epoch / end_epoch)
+                decayed = initial_bg * (1.0 - fraction)
+                self._current_bg_weight = max(decayed, floor)
+            else:
+                self._current_bg_weight = initial_bg
+
+        self.log('train/bg_weight', self._current_bg_weight, prog_bar=True, sync_dist=True)
 
     def training_step(self, batch, batch_idx):
         _, _, h, w = batch["context"][0]["img"].shape
@@ -162,20 +197,16 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
              for t in batch['target']], dim=1
         ).to(mask.device)
 
-        # Render normal maps using the same differentiable CUDA rasterizer
-        # via the colors_precomp trick — no CUDA kernel changes needed.
-        rendered_normals = self.decoder.render_normals(batch, pred1, pred2, (h, w))
-
-        loss, mse, lpips, norm_loss = self.calculate_loss(
-            batch, view1, view2, pred1, pred2, color, rendered_normals, mask, target_mask_human,
+        loss, mse, lpips_val = self.calculate_loss(
+            batch, pred1, pred2, color, mask, target_mask_human,
             apply_mask=self.config.loss.apply_mask,
             average_over_mask=self.config.loss.average_over_mask,
         )
 
-        self.log_metrics('train', loss, mse, lpips, normal_loss=norm_loss)
+        self.log_metrics('train', loss, mse, lpips_val)
         return loss
 
-    def calculate_loss(self, batch, view1, view2, pred1, pred2, color, rendered_normals, geom_mask, dataset_human_mask, apply_mask=True, average_over_mask=True):
+    def calculate_loss(self, batch, pred1, pred2, color, geom_mask, dataset_human_mask, apply_mask=True, average_over_mask=True):
         target_color = torch.stack([target_view['original_img'] for target_view in batch['target']], dim=1)
         predicted_color = color
 
@@ -192,163 +223,126 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
         else:
             mask = final_mask.float()
 
-        # Soft-weighted mask: human pixels = 1.0, background = 0.1
-        # Prevents the network from completely ignoring background structure.
-        background_weight = getattr(self.config.loss, 'background_weight', 0.1)
-        human_mask = mask.float()  # 1.0 on human, 0.0 on background
-        soft_mask = human_mask + background_weight * (1.0 - human_mask)  # [B, V, H, W]
+        # ── Three-zone soft mask ────────────────────────────────────────────
+        # Zone 1: Inner human (eroded intersection mask)          weight = 1.0
+        # Zone 2: Human boundary ring (silhouette minus erosion)  weight = 0.5 fixed
+        #          This protects real human pixels that fall outside the strict
+        #          geom intersection — they always keep a gradient signal.
+        # Zone 3: Background (everything outside silhouette)      weight = bg_weight
+        #          Decays via schedule but floors at bg_weight_floor to avoid
+        #          opacity collapse from complete zero-gradient regions.
+        #
+        # Note: LPIPS is still human-only (inner zone 1 only) — unchanged.
+        background_weight = self._current_bg_weight
+        boundary_weight = getattr(self.config.loss, 'boundary_weight', 0.5)
+
+        inner_human  = mask.float()                           # eroded intersection [B,V,H,W]
+        human_sil    = dataset_human_mask.float()             # full dataset silhouette
+        boundary_ring = (human_sil - inner_human).clamp(0, 1) # ring between silhouette & eroded core
+        background    = 1.0 - human_sil                       # everything outside silhouette
+
+        soft_mask = (
+            inner_human * 1.0
+            + boundary_ring * boundary_weight
+            + background * background_weight
+        )  # [B, V, H, W]
+
+        # human_mask for LPIPS: use inner eroded core only (strict)
+        human_mask = inner_human
 
         flattened_color = einops.rearrange(predicted_color, 'b v c h w -> (b v) c h w')
         flattened_target_color = einops.rearrange(target_color, 'b v c h w -> (b v) c h w')
-        flattened_soft_mask = einops.rearrange(soft_mask, 'b v h w -> (b v) h w')
         flattened_human_mask = einops.rearrange(human_mask, 'b v h w -> (b v) h w')
 
         # --- MSE Loss (soft-masked) ---
         rgb_l2_loss = (predicted_color - target_color) ** 2  # [B, V, C, H, W]
         if average_over_mask:
-            mse_loss = (rgb_l2_loss * soft_mask[:, :, None, :, :]).sum() / soft_mask.sum()
+            mse_loss = (rgb_l2_loss * soft_mask[:, :, None, :, :]).sum() / (soft_mask.sum() + 1e-8)
         else:
             mse_loss = (rgb_l2_loss * soft_mask[:, :, None, :, :]).mean()
 
         # --- LPIPS Loss (human-only, spatial=True needed for per-pixel weighting) ---
         lpips_loss = self.lpips_criterion(flattened_target_color, flattened_color, normalize=True)
         if average_over_mask:
-            lpips_loss = (lpips_loss * flattened_human_mask[:, None, ...]).sum() / flattened_human_mask.sum()
+            lpips_loss = (lpips_loss * flattened_human_mask[:, None, ...]).sum() / (flattened_human_mask.sum() + 1e-8)
         else:
             lpips_loss = lpips_loss.mean()
-
-        # --- Normal Consistency Loss ---
-        # Compares rendered Gaussian normals against GT normal maps from batch.
-        # GT normals are loaded as RGB images (range [0,255]) → remap to [-1, 1].
-        normal_loss = torch.tensor(0.0, device=color.device)
-        normal_loss_weight = getattr(self.config.loss, 'normal_loss_weight', 0.1)
-        if 'normal_map' in batch['target'][0] and normal_loss_weight > 0:
-            gt_normals = torch.stack(
-                [t['normal_map'] for t in batch['target']], dim=1
-            ).float()  # [B, V, C, H, W], range [0, 255] or [0, 1]
-            # Remap [0,1] → [-1, 1] for proper cosine similarity
-            gt_normals = gt_normals * 2.0 - 1.0
-            gt_normals = torch.nn.functional.normalize(gt_normals, dim=2, eps=1e-8)
-            # rendered_normals: [B, V, 3, H, W], already in [-1, 1]
-            cos_sim = torch.nn.functional.cosine_similarity(
-                rendered_normals, gt_normals, dim=2
-            )  # [B, V, H, W]
-            # Apply human mask — only penalize surface normals on the body
-            normal_loss = (1.0 - cos_sim) * human_mask
-            if average_over_mask:
-                normal_loss = normal_loss.sum() / human_mask.sum().clamp(min=1)
-            else:
-                normal_loss = normal_loss.mean()
-            normal_loss = normal_loss_weight * normal_loss
 
         loss = (
             self.config.loss.mse_loss_weight * mse_loss
             + self.config.loss.lpips_loss_weight * lpips_loss
-            + normal_loss
         )
-        
+
         # --- Visualization Logging ---
-        # Save a grid of visualizations early in training and periodically.
-        # This helps quickly verify predicted maps, target maps, normals, and masks.
         if hasattr(self, 'global_step') and (self.global_step < 10 or self.global_step % 100 == 0):
             try:
                 self.save_visualizations(
-                    batch, predicted_color, target_color, rendered_normals, 
-                    gt_normals if 'gt_normals' in locals() else None, 
+                    batch, predicted_color, target_color,
                     human_mask, soft_mask, dataset_human_mask, geom_mask
                 )
             except Exception as e:
                 print(f"Failed to generate visualization: {e}")
-                
-        return loss, mse_loss, lpips_loss, normal_loss
 
-    def save_visualizations(self, batch, predicted_color, target_color, rendered_normals, gt_normals, human_mask, soft_mask, dataset_human_mask, geom_mask):
+        return loss, mse_loss, lpips_loss
+
+    def save_visualizations(self, batch, predicted_color, target_color, human_mask, soft_mask, dataset_human_mask, geom_mask):
         import torchvision
         import os
-        
+
         # Only log from rank 0
         if os.getenv("LOCAL_RANK", "0") != "0":
             return
-            
+
         viz_dir = os.path.join(self.config.save_dir, self.config.name, "visualizations")
         os.makedirs(viz_dir, exist_ok=True)
-        
-        # We will plot the first item in the batch (b=0)
+
         b = 0
         V_tgt = target_color.shape[1]
-        
-        # Grid list which we will fill row by row (each row has exactly V_tgt columns)
-        # Any particular target view 'v' will perfectly align in column 'v'.
         img_list = []
-        
-        # Row 0: Context Views
-        # Plot available context views in the top row, pad with black if V_tgt > num_context
-        # This helps verify exactly what RGB frames the encoder received to build the 3D scene.
+
+        def get_rgb(tensor, v):
+            return tensor[b, v].detach().cpu().clamp(0, 1)
+
+        def to_3ch(tensor_mask, v):
+            return tensor_mask[b, v].detach().cpu().float().unsqueeze(0).repeat(3, 1, 1)
+
+        # Row 0: Context views (pad with black if fewer than V_tgt)
         num_context = len(batch['context'])
         for v in range(V_tgt):
             if v < num_context:
                 img_list.append(batch['context'][v]['original_img'][b].detach().cpu().clamp(0, 1))
             else:
                 img_list.append(torch.zeros_like(target_color[b, v]).cpu())
-                
-        # Helper extraction functions
-        def get_rgb(tensor, v):
-            return tensor[b, v].detach().cpu().clamp(0, 1)
 
-        def to_3ch(tensor_mask, v):
-            return tensor_mask[b, v].detach().cpu().float().unsqueeze(0).repeat(3, 1, 1)
-            
-        def get_masked_norm(tensor, mask_tensor, v):
-            norm = tensor[b, v].detach().cpu() * 0.5 + 0.5
-            mask_raw = mask_tensor[b, v].detach().cpu().unsqueeze(0)
-            return norm * mask_raw
-            
-        # Add Rows representing exactly what changes across Target Views!
-        
-        # Row 1: Target RGB (Ground truth)
+        # Row 1: Target RGB
         for v in range(V_tgt): img_list.append(get_rgb(target_color, v))
-            
+
         # Row 2: Predicted RGB
         for v in range(V_tgt): img_list.append(get_rgb(predicted_color, v))
-            
-        # Row 3: Target Normal (Masked to body for clean visualization)
-        for v in range(V_tgt):
-            if gt_normals is not None:
-                img_list.append(get_masked_norm(gt_normals, dataset_human_mask, v))
-            else:
-                img_list.append(torch.zeros_like(rendered_normals[b, v]).cpu())
-                
-        # Row 4: Predicted Normal (Masked to body)
-        for v in range(V_tgt): img_list.append(get_masked_norm(rendered_normals, dataset_human_mask, v))
-            
-        # Row 5: Splatt3R Geom Mask (intersection of Context views visibility)
+
+        # Row 3: Splatt3R Geom Mask
         for v in range(V_tgt): img_list.append(to_3ch(geom_mask, v))
-            
-        # Row 6: Dataset Mask (Our perfect human silhouette)
+
+        # Row 4: Dataset Human Mask
         for v in range(V_tgt): img_list.append(to_3ch(dataset_human_mask, v))
-            
-        # Row 7: Intersection Loss Mask (Geom Mask & Dataset Mask)
+
+        # Row 5: Intersection Loss Mask (Geom & Dataset)
         for v in range(V_tgt): img_list.append(to_3ch(human_mask, v))
 
-        # Build actual visual grid image out of the list, respecting V_tgt columns!
         grid = torchvision.utils.make_grid(img_list, nrow=V_tgt)
-
-        # Save
         from torchvision.utils import save_image
         step = getattr(self, 'global_step', 0)
         save_path = os.path.join(viz_dir, f"step_{step:06d}.jpg")
         save_image(grid, save_path)
         print(f"Saved visualization to {save_path}")
 
-    def log_metrics(self, prefix, loss, mse, lpips, normal_loss=None, ssim=None):
+    def log_metrics(self, prefix, loss, mse, lpips, ssim=None):
         values = {
             f'{prefix}/loss': loss,
             f'{prefix}/mse': mse,
             f'{prefix}/psnr': -10.0 * mse.log10(),
             f'{prefix}/lpips': lpips,
         }
-        if normal_loss is not None:
-            values[f'{prefix}/normal'] = normal_loss
         if ssim is not None:
             values[f'{prefix}/ssim'] = ssim
         # Enforcing explicit sync_dist=True for Distributed PyTorch Lightning execution over 2+ GPUs
@@ -394,27 +388,26 @@ def run_dist_experiment(config):
 
     print('Building Anatomical Datasets')
     dataset_root = getattr(config.data, 'root', '/ssd_scratch/gnrs/mvhumannet++_10demo')
-    
+
     # Path mappings following DATASET_FORMAT.md
     main_root = os.path.join(dataset_root, 'main')
     depth_root = os.path.join(dataset_root, 'depth')
-    normal_root = os.path.join(dataset_root, 'normal')
     anchor_root = os.path.join(dataset_root, 'anchors')
     adj_path = os.path.join(dataset_root, 'smpl_adj_512.npy')
     fps_path = os.path.join(dataset_root, 'fps_indices_512.npy')
     smplx_model_path = getattr(config.data, 'smplx_model_path', 'smplx_models/')
-    
+
     train_dataset = get_anatomical_dataset(
         main_root=main_root,
         depth_root=depth_root,
-        normal_root=normal_root,
         anchor_root=anchor_root,
         adj_path=adj_path,
         fps_indices_path=fps_path,
         smplx_model_path=smplx_model_path,
         resolution=config.data.resolution,
         sequences=getattr(config.data, 'sequences', None),
-        num_epochs_per_epoch=getattr(config.data, 'epochs_per_train_epoch', 1)
+        num_epochs_per_epoch=getattr(config.data, 'epochs_per_train_epoch', 1),
+        num_target_views=getattr(config.data, 'num_target_views', 2)
     )
     data_loader_train = torch.utils.data.DataLoader(
         train_dataset, shuffle=True, batch_size=config.data.batch_size,

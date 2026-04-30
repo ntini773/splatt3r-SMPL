@@ -1,0 +1,74 @@
+# ==========================================================
+# Anatomical Refinement Fine-Tuning Configuration (Curriculum)
+# ==========================================================
+# Based on finetune_anatomical_mvhumannet.yaml
+include: ['main.yaml']
+
+save_dir: '/ssd_scratch/gnrs/results_finetune_anatomical/${name}/'
+
+splatt3r_checkpoint_path: '/ssd_scratch/gnrs/checkpoints/epoch=19-step=1200.ckpt'
+
+loggers:
+  use_wandb: True
+  use_csv_logger: True
+
+data:
+  root: '/ssd_scratch/gnrs/mvhumannet++_10demo'
+  sequences: null
+  resolution: [512, 512]
+  batch_size: 2
+  num_workers: 4
+  epochs_per_train_epoch: 4
+
+opt:
+  epochs: 5
+  lr: 0.00002
+  accumulate_grad_batches: 4
+
+loss:
+  mse_loss_weight: 1.0
+  lpips_loss_weight: 0.25
+  normal_loss_weight: 0.0
+
+  # ----------------------------
+  # Background-weight curriculum
+  # ----------------------------
+  # If you want background to mean "outside the human silhouette", set mix=human.
+  # This uses: geom_mask * (human_mask + bw * (1 - human_mask))
+  background_weight_mix: 'human'   # 'geom' (default) or 'human'
+
+  # Start with a small background weight, then anneal to zero.
+  background_weight: 0.02
+  background_weight_end: 0.0
+  background_weight_anneal_steps: 2000
+
+  # Optional adaptive switch-to-zero:
+  # If foreground (geom_mask ∩ human_mask) PSNR exceeds this threshold, set bw=0.
+  # Use this as a heuristic "training is stable on the subject".
+  background_weight_zero_fg_psnr: 18.0
+  background_weight_zero_min_step: 500
+
+  apply_mask: True
+  average_over_mask: True
+
+  # ----------------------------
+  # Small crop for robustness
+  # ----------------------------
+  # Crops this many pixels off each border for the loss only.
+  crop_border_px: 8
+
+# ----------------------------------------------------------
+# Pose-translation experiment (debug-only; OFF by default)
+# ----------------------------------------------------------
+# This changes the camera poses used in rendering but does not change the
+# dataset RGB/depth, so it is generally not geometrically consistent.
+# Enable only for diagnostics.
+pose_translation:
+  enabled: false
+  apply_in_train: true
+  apply_in_eval: true
+  mode: 'towards_center'           # 'towards_center' or 'random'
+  only_xy: true
+  translation_step: 0.01           # units are in the decoder's world frame (base-camera coords)
+  translation_std: 0.01            # used only if mode='random'
+  translation_max_norm: 0.02

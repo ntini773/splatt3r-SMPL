@@ -81,17 +81,6 @@ from src.mast3r_src.dust3r.dust3r.utils.geometry import depthmap_to_absolute_cam
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _load_normal_map(path, target_hw):
-    """
-    Deprecated: Using crop_resize_if_necessary directly now.
-    """
-    pass
-
-
 def _build_posed_anchors(smplx_params, fps_indices, smplx_body_model):
     """
     Run the SMPL-X body model forward with the stored per-frame parameters
@@ -147,14 +136,12 @@ class MVHumanNetAnatomicalData(MVHumanNetData):
         self,
         main_root: str,
         depth_root: str,
-        normal_root: str,
         anchor_root: str,
         smplx_model_path: str,
         fps_indices_path: str,
         sequences=None,
     ):
         super().__init__(main_root, depth_root, sequences)
-        self.normal_root = normal_root
         self.anchor_root = anchor_root
 
         # Fixed 512 canonical vertex indices (computed on T-pose, reused for all frames)
@@ -164,25 +151,6 @@ class MVHumanNetAnatomicalData(MVHumanNetData):
         # No need to load the SMPL-X model.
         # We precomputed all 512-vertex anchors as NPZ files inside anchors/
         self.smplx_model = None
-
-    def get_normal(self, seq, cam_id, frame_name, resolution):
-        """
-        Load GT normal map and apply identical crop+resize as RGB images.
-        """
-        path = os.path.join(self.normal_root, seq, 'normal', cam_id, f'{frame_name}.jpg')
-        if not os.path.exists(path):
-            path = os.path.join(self.normal_root, seq, 'normal', cam_id, f'{frame_name}.png')
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"Strict Check: Normal map not found at {path}")
-                
-        img = Image.open(path).convert('RGB')
-        W, H = img.size
-        dummy_depth = np.zeros((H, W), dtype=np.float32)
-        
-        K = self.cameras[seq][cam_id]['K'].copy()
-        from data.data import crop_resize_if_necessary
-        img, _, _ = crop_resize_if_necessary(img, dummy_depth, K, resolution)
-        return torch.from_numpy(np.array(img).astype(np.float32) / 255.0).permute(2, 0, 1)
 
     def get_anchors(self, seq, frame_name):
         """
@@ -304,11 +272,7 @@ class MVHumanNetAnatomicalDataset(torch.utils.data.Dataset):
         for cam_id in target_cams:
             view = self.data.get_view(seq, cam_id, frame_name, self.resolution)
             view['original_img'] = self.org_transform(view['original_img'])
-
-            # Mask and Normal maps applying identical deterministic crop to align with original img
             view['mask_human'] = self.data.get_mask(seq, cam_id, frame_name, self.resolution)
-            view['normal_map'] = self.data.get_normal(seq, cam_id, frame_name, self.resolution)
-
             views['target'].append(view)
 
         views['smplx'] = self.data.get_smplx(seq, frame_name)
@@ -359,7 +323,6 @@ class MVHumanNetAnatomicalTestDataset(torch.utils.data.Dataset):
         target = self.data.get_view(seq, cam_target, frame_name, self.resolution)
         target['original_img'] = self.org_transform(target['original_img'])
         target['mask_human'] = self.data.get_mask(seq, cam_target, frame_name, self.resolution)
-        target['normal_map'] = self.data.get_normal(seq, cam_target, frame_name, self.resolution)
 
         return {
             'context':  [ctx1, ctx2],
@@ -377,7 +340,6 @@ class MVHumanNetAnatomicalTestDataset(torch.utils.data.Dataset):
 def get_anatomical_dataset(
     main_root: str,
     depth_root: str,
-    normal_root: str,
     anchor_root: str,
     adj_path: str,
     fps_indices_path: str,
@@ -385,26 +347,27 @@ def get_anatomical_dataset(
     resolution,
     sequences=None,
     num_epochs_per_epoch: int = 1,
+    num_target_views: int = 2,
 ):
     """
     Build an AnatomicalRefinement training dataset.
     All root paths match the structure in DATASET_FORMAT.md.
     """
     data = MVHumanNetAnatomicalData(
-        main_root, depth_root, normal_root, anchor_root,
+        main_root, depth_root, anchor_root,
         smplx_model_path, fps_indices_path, sequences
     )
     adj = torch.from_numpy(np.load(adj_path).astype(np.float32))
     return MVHumanNetAnatomicalDataset(
         data=data, adj=adj, resolution=resolution,
         num_epochs_per_epoch=num_epochs_per_epoch,
+        num_target_views=num_target_views,
     )
 
 
 def get_anatomical_test_dataset(
     main_root: str,
     depth_root: str,
-    normal_root: str,
     anchor_root: str,
     adj_path: str,
     fps_indices_path: str,
@@ -418,7 +381,7 @@ def get_anatomical_test_dataset(
     samples: list of (seq, cam_ctx_1, cam_ctx_2, cam_target, frame_name) tuples.
     """
     data = MVHumanNetAnatomicalData(
-        main_root, depth_root, normal_root, anchor_root,
+        main_root, depth_root, anchor_root,
         smplx_model_path, fps_indices_path, sequences
     )
     adj = torch.from_numpy(np.load(adj_path).astype(np.float32))

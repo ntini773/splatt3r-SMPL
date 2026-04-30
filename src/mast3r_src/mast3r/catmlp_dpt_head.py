@@ -252,14 +252,12 @@ class GaussianHead(PixelwiseTaskWithDPT):
         torch.nn.init.zeros_(self.prior_attention.out_proj.bias)
 
     def forward(self, decout, img_shape, human_prior_features=None):
-        def _get_dim(v):
-            if isinstance(v, torch.Tensor):
-                return int(v.flatten()[0].item())
-            elif isinstance(v, (list, tuple)):
-                return int(v[0])
-            return int(v)
-            
-        H, W = _get_dim(img_shape[0]), _get_dim(img_shape[1])
+        if isinstance(img_shape, torch.Tensor) and img_shape.ndim >= 2:
+            H, W = int(img_shape[0, 0].item()), int(img_shape[0, 1].item())
+        elif isinstance(img_shape, torch.Tensor) and img_shape.ndim == 1:
+            H, W = int(img_shape[0].item()), int(img_shape[1].item())
+        else:
+            H, W = int(img_shape[0]), int(img_shape[1])
         
         # pass through the heads
         pts3d = self.dpt(decout, image_size=(H, W))

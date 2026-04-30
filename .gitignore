@@ -5,3 +5,4 @@ checkpoints/
 runs/
 results/
 lightning_logs/
+graphify-out
