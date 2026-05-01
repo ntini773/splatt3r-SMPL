@@ -1,0 +1,33 @@
+include: ['benchmark_refined_splat3r.yaml']
+
+# Inference-specific overrides (these will override values from the included config)
+name: nview_mesh_aware_default
+
+# Input dataset (split optional; set null for no split subfolder)
+dataset_root: /ssd_scratch/gnrs/mvhumannet++_10demo
+split: null
+
+# Required SMPL / mesh assets
+adj_path: /ssd_scratch/gnrs/mvhumannet++_10demo/smpl_adj_512.npy
+fps_indices_path: /ssd_scratch/gnrs/mvhumannet++_10demo/fps_indices_512.npy
+smplx_model_path: /ssd_scratch/gnrs/checkpoints/smplx/models
+
+# Model checkpoints (this should point to the anatomical refinement checkpoint)
+model: /ssd_scratch/gnrs/gcn_checkpoints/anatomical-epoch=21-train/loss=0.3257.ckpt
+
+# Optional retrieval checkpoint (.pth)
+# Set to null to disable retrieval pairing and use complete graph pairing.
+retrieval_ckpt: /home2/gnrs/sfm/splatt3r_gcn/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth
+
+# Inference settings
+num_views: 4
+photometric_loss_w: 0.5
+opt_depth: false
+opt_pose: false
+opt_focal: false
+random_batch: true
+max_batches: 1
+resolution: 512
+
+# Outputs
+output_dir: /ssd_scratch/gnrs/results_nview_gcn_test

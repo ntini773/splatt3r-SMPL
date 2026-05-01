@@ -472,6 +472,7 @@ def smplx_collate_fn(batch_list):
     1. Stacking 'context' and 'target' views (lists of dicts).
     2. Stacking 'smplx' parameters (nested dict of tensors).
     3. Collecting 'scene' names (list of strings).
+    4. Stacking 'smpl_adj' (fixed adjacency matrix, same for all samples).
     """
     assert len(batch_list) > 0
     
@@ -514,5 +515,15 @@ def smplx_collate_fn(batch_list):
                     val = torch.from_numpy(val)
                 tensors.append(val)
             out['smplx'][k] = torch.stack(tensors, dim=0)
+
+    # 3. Collate SMPL-X Adjacency Matrix (fixed, same for all samples)
+    if 'smpl_adj' in batch_list[0]:
+        tensors = []
+        for b in batch_list:
+            val = b['smpl_adj']
+            if isinstance(val, np.ndarray):
+                val = torch.from_numpy(val)
+            tensors.append(val)
+        out['smpl_adj'] = torch.stack(tensors, dim=0)
 
     return out

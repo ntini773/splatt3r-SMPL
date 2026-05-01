@@ -211,6 +211,8 @@ class MVHumanNetAnatomicalDataset(torch.utils.data.Dataset):
         num_context_views: int = NUM_CONTEXT_VIEWS,
         num_target_views:  int = NUM_TARGET_VIEWS,
         num_epochs_per_epoch: int = 1,
+        num_views: int = 4,  # Fixed number of camera views (4-5)
+        view_ids: list = None,
     ):
         super().__init__()
         self.data              = data
@@ -218,6 +220,8 @@ class MVHumanNetAnatomicalDataset(torch.utils.data.Dataset):
         self.resolution        = resolution
         self.num_context_views = num_context_views
         self.num_target_views  = num_target_views
+        self.num_views         = num_views            # Fixed 4-5 views for inference
+        self.view_ids          = view_ids
 
         self.transform     = ImgNorm
         self.org_transform = torchvision.transforms.ToTensor()
@@ -239,18 +243,19 @@ class MVHumanNetAnatomicalDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         seq, frame_name = self.index[idx]
 
-        cam_order    = random.sample(ALL_CAMERA_IDS, len(ALL_CAMERA_IDS))
-        context_cams = cam_order[:self.num_context_views]
-        target_cams  = cam_order[self.num_context_views:
-                                  self.num_context_views + self.num_target_views]
+        # Select cameras deterministically if view_ids provided, otherwise random
+        if self.view_ids is not None:
+            cam_order = self.view_ids[:self.num_views]
+        else:
+            cam_order = random.sample(ALL_CAMERA_IDS, min(self.num_views, len(ALL_CAMERA_IDS)))
 
         # Load mesh anchors ONCE per frame (same across all cameras for the same frame)
         anchors = self.data.get_anchors(seq, frame_name)  # [512, 3]
 
         views = {'context': [], 'target': [], 'scene': seq, 'smpl_adj': self.adj}
 
-        # ── Context views ─────────────────────────────────────────────────────
-        for cam_id in context_cams:
+        # ── Context views (all selected cameras) ─────────────────────────────────────────────────────
+        for cam_id in cam_order:
             view = self.data.get_view(seq, cam_id, frame_name, self.resolution)
 
             view['img']          = self.transform(view['original_img'])
@@ -266,14 +271,13 @@ class MVHumanNetAnatomicalDataset(torch.utils.data.Dataset):
             # Anchor vertices: same for all cameras of this frame
             view['mesh_anchors'] = torch.from_numpy(anchors)  # [512, 3]
 
-            views['context'].append(view)
+            # Add per-view metadata for mesh conditioning
+            view['image_path'] = os.path.join(self.data.main_root, seq, 'images', cam_id, f'{frame_name}.jpg')
+            view['camera_id'] = cam_id
+            view['sequence'] = seq
+            view['frame_name'] = frame_name
 
-        # ── Target views ──────────────────────────────────────────────────────
-        for cam_id in target_cams:
-            view = self.data.get_view(seq, cam_id, frame_name, self.resolution)
-            view['original_img'] = self.org_transform(view['original_img'])
-            view['mask_human'] = self.data.get_mask(seq, cam_id, frame_name, self.resolution)
-            views['target'].append(view)
+            views['context'].append(view)
 
         views['smplx'] = self.data.get_smplx(seq, frame_name)
         return views
@@ -386,3 +390,42 @@ def get_anatomical_test_dataset(
     )
     adj = torch.from_numpy(np.load(adj_path).astype(np.float32))
     return MVHumanNetAnatomicalTestDataset(data, adj, samples, resolution)
+
+
+def get_anatomical_nview_dataset(
+    main_root: str,
+    depth_root: str,
+    anchor_root: str,
+    adj_path: str,
+    fps_indices_path: str,
+    smplx_model_path: str,
+    resolution,
+    sequences=None,
+    num_views: int = 4,
+    num_epochs_per_epoch: int = 1,
+    view_ids: list = None,
+):
+    """
+    Build an N-view dataset for mesh-aware inference.
+    
+    Args:
+        num_views: Fixed number of camera views (4-5 recommended)
+        num_epochs_per_epoch: Set to 1 for inference (no repetition)
+        view_ids: Specific camera IDs to load (e.g. ['cam_00', 'cam_01', ...])
+    
+    Returns:
+        MVHumanNetAnatomicalDataset with fixed cameras + image_paths + mesh metadata
+    """
+    data = MVHumanNetAnatomicalData(
+        main_root, depth_root, anchor_root,
+        smplx_model_path, fps_indices_path, sequences
+    )
+    adj = torch.from_numpy(np.load(adj_path).astype(np.float32))
+    return MVHumanNetAnatomicalDataset(
+        data=data, adj=adj, resolution=resolution,
+        num_context_views=num_views,
+        num_target_views=0,  # All views are context (no split)
+        num_epochs_per_epoch=num_epochs_per_epoch,
+        num_views=num_views,
+        view_ids=view_ids,
+    )
