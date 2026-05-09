@@ -21,7 +21,7 @@ retrieval_ckpt: /home2/gnrs/sfm/splatt3r_gcn/checkpoints/MASt3R_ViTLarge_BaseDec
 
 # Inference settings
 num_views: 4
-photometric_loss_w: 0.5
+photometric_loss_w: 0.0
 opt_depth: false
 opt_pose: false
 opt_focal: false

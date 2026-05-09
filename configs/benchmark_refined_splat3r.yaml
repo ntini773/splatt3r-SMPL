@@ -19,7 +19,7 @@ refined_checkpoint_path: '/ssd_scratch/gnrs/gcn_checkpoints/anatomical-epoch=21-
 
 # Output directory used by refined_splatt3r_benchmark.py
 # Saved files: results.json, metrics.txt, visualizations/*.jpg
-eval_save_dir: '/ssd_scratch/gnrs/refined_splatt3r_eval_results'
+eval_save_dir: '/ssd_scratch/gnrs/refined_splatt3r_eval_results_second_test'
 
 # Keep logger settings consistent with your existing benchmark setup.
 loggers:
@@ -31,7 +31,7 @@ data:
 
   # null means auto-discover all sequences in root/main/
   # or provide a subset list
-  sequences: ['100839', '100840']
+  sequences: ['100840']
 
   resolution: [512, 512]
   batch_size: 2

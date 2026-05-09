@@ -25,7 +25,7 @@ data:
   # Sequences:
   # - null means auto-discover all sequences inside root/main/
   # - or supply a list like ['100831', '100832']
-  sequences: ['100839', '100840']
+  sequences: [ '100840']
   
   resolution: [512, 512]
   batch_size: 2          # Increase if your multi-GPU setup has VRAM overhead

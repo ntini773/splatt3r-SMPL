@@ -1,0 +1,47 @@
+MODEL:
+
+    NAME: 'PEAR_infer'
+    add_teeth: True
+    flame_assets_dir: 'assets/FLAME'
+    smplx_assets_dir: 'assets/SMPLX'
+    mano_assets_dir: 'assets/MANO'
+
+
+BACKBONE:
+    depth : 32
+    drop_path_rate : 0.55
+    embed_dim : 1280
+    img_size : [256, 192]
+    mlp_ratio : 4
+    num_heads : 16
+    patch_size : 16
+    qkv_bias : True
+    ratio : 1
+    use_checkpoint : False
+    backbone_ckpt : "data_inputs/backbone/vitpose_backbone.pth"
+
+HEAD:
+    context_dim : 1280
+    depth  : 6
+    dim_head : 64
+    dropout : 0.0
+    emb_dropout : .0
+    heads : 8
+    mlp_dim : 1024
+    norm : 'layer'
+
+
+TRAIN:
+    exp_str: 'exps_ehmv2'
+    batch_size: 2  # 48 GB for 24           24 会爆显存
+    train_iter: 15000
+    check_interval: 50000 #10000
+
+
+DATASET:
+    NAME: 'Ubody_0'
+    origin_image_size: 1024
+    head_crop_size: 512
+    hand_crop_size: 512
+
+

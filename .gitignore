@@ -1,8 +1,39 @@
-__pycache__/*
+# Python
+__pycache__/
 *.pyc
-.gradio
-checkpoints/
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Checkpoints & large model weights (download via scripts/download_checkpoints.sh)
+checkpoints/*.pth
+checkpoints/*.ckpt
+checkpoints/*.pt
+*.ckpt
+*.pt
+
+# Results & logs
 runs/
 results/
 lightning_logs/
-graphify-out
+scale_debug/
+scale_debug_base/
+graphify-out/
+
+# Gradio / demo cache
+.gradio/
+
+# Dataset (not redistributable — see RUN.md for download instructions)
+data/scannetpp/
+
+# Scratch / temp
+*.tmp
+*.log
+nohup.out
+
+# IDE
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,11 @@
+import torch
+from torch.optim.swa_utils import AveragedModel
+
+class ExponentialMovingAverage(AveragedModel):
+    """Maintains moving averages of model parameters using an exponential decay.
+    ema_avg = decay * avg_model_param + (1 - decay) * model_param
+    """
+    def __init__(self, model, decay, device="cpu"):
+        def ema_avg(avg_model_param, model_param, num_averaged):
+            return decay * avg_model_param + (1 - decay) * model_param
+        super().__init__(model, device, ema_avg, use_buffers=True)

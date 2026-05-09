@@ -491,6 +491,30 @@ def get_reconstructed_scene_nview(
                 mesh_anchors=mesh_anchors_dict,
             )
 
+        # ── Depth diagnostic ──────────────────────────────────────────────
+        print(f"  [DIAG] Post-optimisation depth check for '{scene_name}':")
+        try:
+            _diag_pts, _diag_dm, _diag_cf = scene_graph.get_dense_pts3d()
+            for _vi, (_pts, _dm) in enumerate(zip(_diag_pts, _diag_dm)):
+                _z = _pts[..., 2].detach().cpu()
+                _dm_cpu = _dm.detach().cpu()
+                _cf = _diag_cf[_vi].detach().cpu()
+                print(
+                    f"    view {_vi}: z=[{_z.min():.4f}, {_z.max():.4f}]  "
+                    f"depth=[{_dm_cpu.min():.4f}, {_dm_cpu.max():.4f}]  "
+                    f"conf_mean={_cf.mean():.3f}"
+                )
+            # Collapse heuristic: flag if all z-ranges are suspiciously small
+            _z_ranges = [(_pts[..., 2].max() - _pts[..., 2].min()).item() for _pts in _diag_pts]
+            if max(_z_ranges) < 0.05:
+                print("    ⚠ DEPTH COLLAPSE DETECTED — z-ranges < 0.05 across all views!")
+                print("      Consider: --opt_depth True, or increase log_sizes regulariser.")
+            else:
+                print(f"    ✓ Depth looks healthy (max z-range={max(_z_ranges):.4f})")
+        except Exception as _e:
+            print(f"    ⚠ Depth diagnostic failed: {_e}")
+        # ─────────────────────────────────────────────────────────────────
+
         # Wrap scene graph and metadata in a dict
         scene = {
             'graph': scene_graph,
@@ -588,59 +612,113 @@ def export_gaussian_renderings(
                 H, W = _resolve_image_size(img_obj, (512, 512))
                 rendered = np.ones((H, W, 3), dtype=np.uint8) * 255
             else:
-                # Extract gaussian parameters
-                means = gauss_attrs.get('means', None)  # [H, W, 3]
-                scales = gauss_attrs.get('scales', None)  # [H, W, 3]
-                rotations = gauss_attrs.get('rotations', None)  # [H, W, 4]
+                # Extract gaussian parameters (scales/rots/opacities/sh only — NOT means)
+                scales = gauss_attrs.get('scales', None)     # [H, W, 3]
+                rotations = gauss_attrs.get('rotations', None)  # [H, W, 4]  xyzw, camera-local
                 opacities = gauss_attrs.get('opacities', None)  # [H, W, 1]
-                sh = gauss_attrs.get('sh', None)  # [H, W, 3*sh_degree]
-                
-                if means is None or sh is None:
+                sh = gauss_attrs.get('sh', None)             # [H, W, 3*sh_degree]
+
+                # ── FIX: use optimised world-space pts3d as means ────────
+                # Cached 'means' live in the 2-view camera frame and become
+                # stale after the optimizer moves cam2w. get_dense_pts3d()
+                # returns properly world-space points.
+                means_world = None
+                try:
+                    _dense_pts, _, _ = scene_graph.get_dense_pts3d()
+                    if view_idx < len(_dense_pts):
+                        means_world = _dense_pts[view_idx].reshape(-1, 3)
+                        if isinstance(means_world, torch.Tensor):
+                            means_world = means_world.detach().cpu().numpy()
+                        print(f"    [DIAG] view {view_idx}: using world-space pts3d as means "
+                              f"(n={len(means_world)}, z=[{means_world[:,2].min():.3f}, {means_world[:,2].max():.3f}])")
+                except Exception as _me:
+                    print(f"    ⚠ Could not fetch dense pts3d for view {view_idx}: {_me}")
+
+                if means_world is None:
+                    # Hard fallback: use (possibly stale) cached means
+                    _cached_means = gauss_attrs.get('means', None)
+                    if _cached_means is not None:
+                        means_world = _cached_means.cpu().numpy() if isinstance(_cached_means, torch.Tensor) else _cached_means
+                        means_world = means_world.reshape(-1, 3)
+                        print(f"    ⚠ view {view_idx}: falling back to cached (camera-local) means")
+                # ─────────────────────────────────────────────────────────
+
+                if means_world is None or sh is None:
                     print(f"    ⚠ Invalid gaussian attributes for view {view_idx}, skipping")
                     H, W = _resolve_image_size(img_obj, (512, 512))
                     rendered = np.ones((H, W, 3), dtype=np.uint8) * 128
                 else:
-                    # Convert all to numpy
-                    means_np = means.cpu().numpy() if isinstance(means, torch.Tensor) else means
-                    scales_np = scales.cpu().numpy() if isinstance(scales, torch.Tensor) else scales
-                    rotations_np = rotations.cpu().numpy() if isinstance(rotations, torch.Tensor) else rotations
-                    opacities_np = opacities.cpu().numpy() if isinstance(opacities, torch.Tensor) else opacities
-                    sh_np = sh.cpu().numpy() if isinstance(sh, torch.Tensor) else sh
-                    
-                    if sh_np.ndim > 3 and sh_np.shape[-1] == 1:
+                    means_np = means_world  # already numpy (N, 3)
+                    n = len(means_np)
+
+                    def _to_np_flat(t, last_dim):
+                        """Tensor/array → (N, last_dim) numpy."""
+                        arr = t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else np.asarray(t)
+                        arr = arr.reshape(-1, last_dim)
+                        # align length to n
+                        if arr.shape[0] > n:
+                            arr = arr[:n]
+                        elif arr.shape[0] < n:
+                            arr = np.concatenate([arr, np.repeat(arr[-1:], n - arr.shape[0], axis=0)])
+                        return arr
+
+                    scales_np    = _to_np_flat(scales, 3)    if scales    is not None else np.ones((n, 3), np.float32) * 0.01
+                    rotations_np = _to_np_flat(rotations, 4) if rotations is not None else np.tile([0.,0.,0.,1.], (n,1)).astype(np.float32)
+                    opacities_np = _to_np_flat(opacities, 1) if opacities is not None else np.ones((n, 1), np.float32) * 2.0
+                    sh_np        = _to_np_flat(sh, sh.reshape(-1, sh.shape[-1] if sh.ndim > 1 else 1).shape[-1]) \
+                                   if sh is not None else np.zeros((n, 3), np.float32)
+
+                    if sh_np.ndim > 2 and sh_np.shape[-1] == 1:
                         sh_np = sh_np.squeeze(-1)
-                    
+
+                    # ── FIX: rotate quaternions from camera-local → world ─
+                    # rotations_np is xyzw in the view's camera frame.
+                    # We need world-frame quaternions for correct splatting.
+                    try:
+                        from scipy.spatial.transform import Rotation as _R
+                        refined_poses_q = scene_graph.get_im_poses()
+                        _pose_q = refined_poses_q[view_idx]
+                        _pose_np_q = _pose_q.detach().cpu().numpy() if isinstance(_pose_q, torch.Tensor) else _pose_q
+                        R_cam2w = _pose_np_q[:3, :3]
+                        r_world = _R.from_matrix(R_cam2w) * _R.from_quat(rotations_np)  # xyzw expected by scipy
+                        rotations_np = r_world.as_quat().astype(np.float32)  # xyzw
+                        print(f"    [DIAG] view {view_idx}: rotations rotated to world frame")
+                    except Exception as _re:
+                        print(f"    ⚠ view {view_idx}: could not rotate quaternions to world frame: {_re}")
+                    # ─────────────────────────────────────────────────────
+
                     # Add base image SH to residual SH
                     try:
                         img_rgb = img_obj['img'][0].permute(1, 2, 0).cpu().numpy()
                         img_rgb = (img_rgb * 0.5 + 0.5).clip(0, 1)
-                        if img_rgb.shape[:2] != means_np.shape[:2]:
-                            import cv2
-                            img_rgb = cv2.resize(img_rgb, (means_np.shape[1], means_np.shape[0]), interpolation=cv2.INTER_LANCZOS4)
-                        base_sh = (img_rgb - 0.5) / 0.28209479177387814
+                        _sh_h = int(np.round(np.sqrt(n * img_rgb.shape[0] / img_rgb.shape[1])))
+                        _sh_w = int(np.round(np.sqrt(n * img_rgb.shape[1] / img_rgb.shape[0])))
+                        step = max(1, img_rgb.shape[0] // max(_sh_h, 1))
+                        base_sh = (img_rgb[::step, ::step].reshape(-1, 3)[:n] - 0.5) / 0.28209479177387814
+                        if base_sh.shape[0] < n:
+                            base_sh = np.concatenate([base_sh, np.repeat(base_sh[-1:], n - base_sh.shape[0], axis=0)])
                         sh_np = sh_np + base_sh
                     except Exception as e:
                         print(f"    ⚠ Could not add base SH: {e}")
-                    
+
                     # Get optimized camera parameters from scene_graph
                     refined_poses = scene_graph.get_im_poses()
                     refined_Ks = getattr(scene_graph, 'intrinsics', None)
-                    
+
                     pose = refined_poses[view_idx]
-                    pose_np = pose.cpu().numpy() if isinstance(pose, torch.Tensor) else pose
-                    
+                    pose_np = pose.detach().cpu().numpy() if isinstance(pose, torch.Tensor) else pose
+
                     if refined_Ks is not None:
                         K_np = refined_Ks[view_idx]
-                        if isinstance(K_np, torch.Tensor): K_np = K_np.cpu().numpy()
+                        if isinstance(K_np, torch.Tensor): K_np = K_np.detach().cpu().numpy()
                     else:
-                        # Fallback if intrinsics not in scene_graph (unlikely)
                         H, W = _resolve_image_size(img_obj, (512, 512))
                         K_np = np.array([[W, 0, W/2], [0, W, H/2], [0, 0, 1]], dtype=np.float32)
-                    
+
                     # Get image size
                     image_size = _resolve_image_size(img_obj, (512, 512))
-                    
-                    # Render with optimized parameters
+
+                    # Render with optimized parameters + world-space means
                     rendered, depth = render_gaussian_splats(
                         means_np, scales_np, rotations_np, opacities_np, sh_np,
                         K_np, pose_np, image_size, device
@@ -720,6 +798,17 @@ def export_gaussian_renderings(
 
 
 def export_scene_ply(scene: Dict, imgs: List[Dict], output_dir: str, conf_thresh: float = 0.0):
+    """Export a scene-level gaussian point cloud to `scene.ply`.
+
+    Also saves `scene_clean.ply` with three automatic quality masks applied:
+      1. confidence > conf_thresh  (removes uncertain Gaussians)
+      2. depth > 0.01             (removes behind-camera spike/streak noise)
+      3. sigmoid(opacity) > 0.05  (removes near-invisible floaters)
+
+    Args:
+        conf_thresh: minimum canonical-view confidence to keep a Gaussian.
+                     0.0 = keep all (raw), recommend 1.5 for clean export.
+    """
     """Export a scene-level gaussian point cloud to `scene.ply`."""
     scene_dir = Path(output_dir) / scene['scene_name']
     scene_dir.mkdir(parents=True, exist_ok=True)
@@ -733,13 +822,16 @@ def export_scene_ply(scene: Dict, imgs: List[Dict], output_dir: str, conf_thresh
         return
 
     try:
-        dense_pts3d, _, confs = scene_graph.get_dense_pts3d()
+        dense_pts3d, dense_depthmaps, confs = scene_graph.get_dense_pts3d()
         poses = scene_graph.get_im_poses()
     except Exception as e:
         print(f"  ⚠ Failed to get dense points or poses for PLY export: {e}")
         return
 
+    # Raw arrays (conf-filtered) and quality tuples for the clean PLY
     all_xyz, all_op, all_sc, all_rot, all_sh = [], [], [], [], []
+    all_quality_tuples = []   # (means_np, op, sc, rt_ply, sh, quality_mask)
+    view_stats = []
 
     for view_idx in range(min(len(file_paths), len(dense_pts3d))):
         img_instance = str(file_paths[view_idx])
@@ -749,6 +841,15 @@ def export_scene_ply(scene: Dict, imgs: List[Dict], output_dir: str, conf_thresh
 
         means = dense_pts3d[view_idx].reshape(-1, 3)
         n = means.shape[0]
+        means_np = means.detach().cpu().numpy() if isinstance(means, torch.Tensor) else np.asarray(means)
+
+        # Per-view depthmap for positivity filtering
+        depth_np = None
+        if view_idx < len(dense_depthmaps):
+            _d = dense_depthmaps[view_idx]
+            _d_np = _d.detach().cpu().numpy().reshape(-1) if isinstance(_d, torch.Tensor) else np.asarray(_d).reshape(-1)
+            if _d_np.shape[0] == n:
+                depth_np = _d_np
 
         def _as_np(name, default):
             val = gauss_attrs.get(name, None)
@@ -766,74 +867,118 @@ def export_scene_ply(scene: Dict, imgs: List[Dict], output_dir: str, conf_thresh
                 val = val[:n]
             return val
 
-        means_np = means.detach().cpu().numpy() if isinstance(means, torch.Tensor) else np.asarray(means)
         op = _as_np('opacities', np.ones((n, 1), dtype=np.float32) * 2.0)
         sc = _as_np('scales', np.ones((n, 3), dtype=np.float32) * 0.01)
-        
-        # Rotations from network are xyzw and in local camera coordinates!
-        rt_local = _as_np('rotations', np.tile(np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float32), (n, 1))) # default xyzw identity
-        
-        # Transform rotations to world coordinates using cam2w
+
+        # Rotations: camera-local xyzw -> world wxyz
+        rt_local = _as_np('rotations', np.tile(np.array([[0., 0., 0., 1.]], dtype=np.float32), (n, 1)))
         try:
             from scipy.spatial.transform import Rotation
-            pose = poses[view_idx].cpu().numpy() if isinstance(poses[view_idx], torch.Tensor) else poses[view_idx]
-            R_cam2w = pose[:3, :3]
-            r_cam = Rotation.from_matrix(R_cam2w)
-            r_local = Rotation.from_quat(rt_local) # expects xyzw
-            r_global = r_cam * r_local
+            pose_v = poses[view_idx].cpu().numpy() if isinstance(poses[view_idx], torch.Tensor) else poses[view_idx]
+            R_cam2w = pose_v[:3, :3]
+            r_global = Rotation.from_matrix(R_cam2w) * Rotation.from_quat(rt_local)
             rt_global_xyzw = r_global.as_quat().astype(np.float32)
-            
-            # Convert xyzw -> wxyz for standard 3DGS PLY export
             rt_ply = np.concatenate([rt_global_xyzw[:, 3:4], rt_global_xyzw[:, 0:3]], axis=-1)
-        except Exception as e:
-            print(f"    ⚠ Failed to rotate quaternions: {e}")
+        except Exception as _re:
+            print(f"    ⚠ Failed to rotate quaternions for view {view_idx}: {_re}")
             rt_ply = np.concatenate([rt_local[:, 3:4], rt_local[:, 0:3]], axis=-1)
-        
-        # Load and combine SH
+
+        # SH: residual + image base colour
         sh_res = _as_np('sh', np.zeros((n, 3), dtype=np.float32))
         try:
             img_rgb = imgs[view_idx]['img'][0].permute(1, 2, 0).cpu().numpy()
             img_rgb = (img_rgb * 0.5 + 0.5).clip(0, 1)
-            # Find closest integer shape for subsampling if needed
-            orig_H, orig_W = img_rgb.shape[:2]
-            step = max(1, int(np.sqrt(orig_H * orig_W / n)))
+            step = max(1, int(np.sqrt(img_rgb.shape[0] * img_rgb.shape[1] / n)))
             base_sh = (img_rgb[::step, ::step].reshape(-1, 3)[:n] - 0.5) / 0.28209479177387814
             if base_sh.shape[0] < n:
-                pad = np.repeat(base_sh[-1:], n - base_sh.shape[0], axis=0)
-                base_sh = np.concatenate([base_sh, pad], axis=0)
+                base_sh = np.concatenate([base_sh, np.repeat(base_sh[-1:], n - base_sh.shape[0], axis=0)])
             sh = sh_res + base_sh
         except Exception:
             sh = sh_res
 
+        # ── Quality masks ───────────────────────────────────────────────────────────
+        # Mask 1 - confidence
         cf = confs[view_idx]
         if isinstance(cf, torch.Tensor):
             cf = cf.detach().cpu().numpy()
         cf = np.asarray(cf).reshape(-1)
-        if cf.shape[0] != n:
-            # If confidence layout differs, skip filtering for this view.
-            mask = np.ones((n,), dtype=bool)
+        if cf.shape[0] == n:
+            conf_mask = (cf > conf_thresh) if conf_thresh > 0 else np.ones(n, dtype=bool)
         else:
-            mask = cf > conf_thresh if conf_thresh > 0 else np.ones((n,), dtype=bool)
+            conf_mask = np.ones(n, dtype=bool)
 
-        all_xyz.append(means_np[mask])
-        all_op.append(op[mask])
-        all_sc.append(sc[mask])
-        all_rot.append(rt_ply[mask])
-        all_sh.append(sh[mask])
+        # Mask 2 - positive depth (negative depths -> behind camera -> spike/streak noise)
+        if depth_np is not None:
+            depth_mask = depth_np > 0.01
+            n_neg = int((depth_np <= 0.01).sum())
+        else:
+            depth_mask = np.ones(n, dtype=bool)
+            n_neg = 0
+
+        # Mask 3 - opacity sigmoid > 0.05 (remove near-invisible floaters)
+        op_sigmoid = 1.0 / (1.0 + np.exp(-op[:, 0].clip(-20, 20)))
+        opacity_mask = op_sigmoid > 0.05
+        n_low_op = int((~opacity_mask).sum())
+
+        quality_mask = conf_mask & depth_mask & opacity_mask
+
+        # Per-view stats
+        z_vals = means_np[:, 2]
+        stat = {
+            'view': view_idx, 'total': n,
+            'conf_kept': int(conf_mask.sum()), 'neg_depth': n_neg,
+            'low_opacity': n_low_op, 'quality_kept': int(quality_mask.sum()),
+            'z_range': [float(z_vals.min()), float(z_vals.max())],
+            'conf_mean': float(cf.mean()) if cf.shape[0] == n else None,
+        }
+        view_stats.append(stat)
+        print(
+            f"    view {view_idx}: total={n}  conf_kept={stat['conf_kept']}  "
+            f"neg_depth={n_neg}  low_opacity={n_low_op}  "
+            f"quality_kept={stat['quality_kept']}  z=[{z_vals.min():.3f},{z_vals.max():.3f}]"
+        )
+
+        # Accumulate raw (conf-only filtered) arrays
+        all_xyz.append(means_np[conf_mask])
+        all_op.append(op[conf_mask])
+        all_sc.append(sc[conf_mask])
+        all_rot.append(rt_ply[conf_mask])
+        all_sh.append(sh[conf_mask])
+        all_quality_tuples.append((means_np, op, sc, rt_ply, sh, quality_mask))
 
     if not all_xyz:
-        print("  ⚠ No gaussian attributes found for any view; skipping scene.ply export")
+        print("  ⚠ No gaussian attributes found for any view; skipping PLY export")
         return
 
-    xyz = np.concatenate(all_xyz, axis=0)
-    op = np.concatenate(all_op, axis=0)
-    sc = np.concatenate(all_sc, axis=0)
-    rt = np.concatenate(all_rot, axis=0)
-    sh = np.concatenate(all_sh, axis=0)
-
+    # Save raw (conf-filtered) PLY
+    xyz = np.concatenate(all_xyz)
+    op  = np.concatenate(all_op)
+    sc  = np.concatenate(all_sc)
+    rt  = np.concatenate(all_rot)
+    sh  = np.concatenate(all_sh)
     ply_path = str(scene_dir / 'scene.ply')
     _save_simple_splat_ply(ply_path, xyz, op, sc, rt, sh)
-    print(f"  ✓ Saved scene ply: {ply_path} (points={xyz.shape[0]})")
+    print(f"  ✓ Saved scene.ply: {ply_path} (points={xyz.shape[0]})")
+
+    # Save scene_clean.ply: conf + positive depth + opacity
+    cxyz, cop, csc, crt, csh = [], [], [], [], []
+    for _mn, _op, _sc, _rt, _sh, _qm in all_quality_tuples:
+        cxyz.append(_mn[_qm]); cop.append(_op[_qm])
+        csc.append(_sc[_qm]);  crt.append(_rt[_qm]); csh.append(_sh[_qm])
+    if cxyz:
+        cxyz = np.concatenate(cxyz); cop = np.concatenate(cop)
+        csc  = np.concatenate(csc);  crt = np.concatenate(crt); csh = np.concatenate(csh)
+        clean_path = str(scene_dir / 'scene_clean.ply')
+        _save_simple_splat_ply(clean_path, cxyz, cop, csc, crt, csh)
+        pct = 100.0 * len(cxyz) / max(xyz.shape[0], 1)
+        print(f"  ✓ Saved scene_clean.ply: {clean_path} (points={len(cxyz)}, {pct:.1f}% of raw)")
+
+    # Save per-view stats JSON
+    stats_path = scene_dir / 'ply_export_stats.json'
+    with open(stats_path, 'w') as _f:
+        json.dump(view_stats, _f, indent=2)
+    print(f"  ✓ PLY stats: {stats_path}")
+
 
 
 def parse_args():
@@ -854,7 +999,7 @@ def parse_args():
     parser.add_argument('--view_ids', type=str, nargs='+', default=None, help='Deterministic views to run (e.g., cam_00 cam_01).')
     
     parser.add_argument('--num_views', type=int, default=None, help='4-5 views')
-    parser.add_argument('--photometric_loss_w', type=float, default=0.5)
+    parser.add_argument('--photometric_loss_w', type=float, default=0.0)
     parser.add_argument('--opt_depth', type=str, default='False', help='Whether to optimize depthmaps (True/False)')
     parser.add_argument('--opt_pose', type=str, default='False', help='Whether to optimize camera poses (True/False)')
     parser.add_argument('--opt_focals', type=str, default='False', help='Whether to optimize camera focal lengths (True/False)')

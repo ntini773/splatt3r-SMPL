@@ -607,7 +607,30 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                 
                 loss = loss_func(K, w2cam, pts3d, pix_loss)
                 loss += loss_dust3r_w * loss_dust3r(cam2w, pts3d, lossd)
-                
+
+                # ── Scale-collapse regulariser ─────────────────────────────
+                # Keeps log_sizes close to 0 (sizes ~ 1) so the optimizer
+                # cannot trivially crush scene scale to zero.
+                _sizes = torch.cat(log_sizes).exp()
+                loss += 1e-3 * (_sizes - 1.0).square().mean()
+                if iter % 50 == 0:
+                    print(f"  [DIAG] Iter {iter}: sizes={to_numpy(_sizes).round(4).tolist()}  "
+                          f"z_cams={to_numpy(_sizes * median_depths * torch.cat(log_focals).exp() / torch.tensor(base_focals, device=device)).round(4).tolist()}")
+                # ──────────────────────────────────────────────────────────
+
+                # ── Depth positivity penalty ──────────────────────────────
+                # Negative depths mean points end up behind a camera and get
+                # placed wildly wrong in world space  → spike/streak noise.
+                # We penalise any depth that goes below a small positive floor.
+                _depth_floor = 0.05  # metres in scaled coords
+                _K_tmp, (_w2c_tmp, _c2w_tmp), _dm_tmp = make_K_cam_depth(
+                    log_focals, pps, trans, quats, log_sizes, core_depth)
+                for _di, _dm in enumerate(_dm_tmp):
+                    _neg = torch.relu(_depth_floor - _dm)  # > 0 only where depth < floor
+                    if _neg.any():
+                        loss += 0.1 * _neg.mean()
+                # ──────────────────────────────────────────────────────────
+
                 if photometric_loss_w > 0 and rasterization is not None:
                     # Filter out None entries from gauss_attrs before passing to loss_photometric
                     valid_gauss_attrs = [g for g in gauss_attrs if g is not None]
@@ -644,6 +667,19 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                 # make sure the pose remains well optimizable
                 for i in range(len(imgs)):
                     quats[i].data[:] /= quats[i].data.norm()
+
+                # ── Gaussian attribute clamping ────────────────────────────
+                # Prevents degenerate splats caused by background Gaussians
+                # that receive large photometric gradients after depth collapse.
+                for _g in gauss_attrs:
+                    if _g is None:
+                        continue
+                    if 'scales' in _g:
+                        _g['scales'].data.clamp_(min=1e-4, max=0.5)
+                    if 'opacities' in _g:
+                        # pre-sigmoid space: sigmoid(-5)~0.007, sigmoid(5)~0.993
+                        _g['opacities'].data.clamp_(min=-5.0, max=5.0)
+                # ──────────────────────────────────────────────────────────
 
                 loss = float(loss)
                 if loss != loss:
@@ -1320,10 +1356,17 @@ def canonical_view(ptmaps11, confs11, subsample, attrs11=None, mode='avg-angle')
                 w_sum = w.sum(dim=0) + 1e-8
                 
                 if k == 'rotations':
-                    # Weighted average of quaternions (approx)
-                    avg = (vals * w).sum(dim=0) / w_sum
-                    avg = avg / (avg.norm(dim=-1, keepdim=True) + 1e-8)
-                    canon_attrs[k] = avg
+                    # ── FIX: weighted-average quaternions are invalid for
+                    # large inter-view rotations (result has near-zero norm
+                    # and normalisation amplifies noise). Use the quaternions
+                    # from the highest-confidence view instead.
+                    best_idx = max(range(len(w_list)), key=lambda _i: float(w_list[_i].mean()))
+                    canon_attrs[k] = vals[best_idx]
+                    # Diagnostics
+                    if any(abs(float(w_list[_i].mean()) - float(w_list[best_idx].mean())) > 0.1
+                           for _i in range(len(w_list))):
+                        print(f"  [DIAG] canonical_view: rotation chosen from view {best_idx} "
+                              f"(conf={float(w_list[best_idx].mean()):.3f})")
                 else:
                     avg = (vals * w).sum(dim=0) / w_sum
                     canon_attrs[k] = avg

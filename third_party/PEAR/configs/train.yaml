@@ -1,0 +1,349 @@
+MODEL:
+    NAME: 'PEAR_train'
+    bg_color: 0 #black 0 white 1
+    sh_degree: 0 #shs ((sh_degree+1)**2)*3   2  1  0
+    color_dim: &color_dim 32 # ((sh_degree+1)**2)*3     27 12 32
+    unprojection_size: 512 # img size for unprojecting points from depth map 296
+    uvmap_size: 512 #uvmap size for gaussians
+    feature_img_size: 256  # img size for extrating feature map 14*xx  original 518
+    feature_part_size: 280
+    image_size: &image_size 512
+    invtanfov: 24
+
+    dino_out_dim: 32   # 256   416-192-3  512-160-2 512-160-6× 512-192-5×
+    uv_out_dim: 96     # 768
+    smplx_fea_dim: 128 # 256
+    prj_out_dim: 128
+    global_vertex_dim: 256
+
+    opacity_threshold: 0.001
+
+    add_teeth: True
+    flame_assets_dir: 'assets/FLAME'
+    smplx_assets_dir: 'assets/SMPLX'
+    mano_assets_dir: 'assets/MANO'
+
+    with_head_feature: False   #Extract head features alone
+    with_static_offset: False
+    with_neural_refiner: True #True
+    with_smplx_tracking: False
+    with_uv_gaussian: True
+    with_smplx_gaussian: True
+    with_inverse_mapping: True
+    vertex_smaple_type: 'projection' #projection, uvmap
+
+
+    refiner_type: 'styleunet'  #styleunet(100) simpleunet(255) spade(150)
+    styleunet:
+        in_size: *image_size 
+        in_dim: *color_dim
+        out_dim: 3
+        out_size: *image_size
+        num_style_feat: 512
+        num_mlp: 8
+        channel_scale: 1
+        small: True
+    simpleunet:
+        in_size: *image_size 
+        in_dim: *color_dim
+        out_dim: 3
+        out_size: *image_size
+        channel_scale: 1
+    spade:
+        in_dim: *color_dim
+        mid_dim: 16
+        label_dim: 16
+        num_mid_blocks: 1
+        num_up_blocks: 0
+
+BACKBONE:
+    depth : 32
+    drop_path_rate : 0.55
+    embed_dim : 1280
+    img_size : [256, 192]
+    mlp_ratio : 4
+    num_heads : 16
+    patch_size : 16
+    qkv_bias : True
+    ratio : 1
+    use_checkpoint : False
+    backbone_ckpt : "data_inputs/backbone/vitpose_backbone.pth"
+
+HEAD:
+    context_dim : 1280
+    depth  : 6
+    dim_head : 64
+    dropout : 0.0
+    emb_dropout : .0
+    heads : 8
+    mlp_dim : 1024
+    norm : 'layer'
+
+
+TRAIN:
+    exp_str: 'exps_ehmv2'
+    batch_size: 40  # 48 GB for 24      
+    train_iter: 200000
+    check_interval: 10000 #10000
+
+OPTIMIZE:
+    name: 'Adam'
+    lr_decay_rate: 0.03
+    lr_decay_iter: 200000
+    learning_rate: 1.0e-4
+    lambda_codebook: 1.0
+    lambda_l1: 1.0 #0.8
+    lambda_ssim: 0.0 #0.2
+    lambda_perpetual: 0.025 #0.025
+    lambda_lbs_weight: 100.0
+    lambda_dist: 1.0 #1.0
+    lambda_opacity_map:  0.0 #1.0 0.01
+    lambda_z_map: 100.0
+    lambda_head_crop: 0.25
+    lambda_hand_crop: 0.1
+    lambda_local_xyz: 0.01
+    lambda_local_scale: 1
+    lambda_reg_static_offset: 1.0e+1 #1.0e+1
+    lambda_reg_static_offset_lap: 3.0e+4 #3.3e+4
+
+    perpetual_increase_iter: 10000
+    # pruning_start_iter: 50000
+    lambda_perpetual_high: 0.05 
+
+    threshold_local_xyz: 3.0
+    threshold_scale: 0.6
+    mask_threshold: 0.01
+DATASET:
+    NAME: 'Ubody_0'
+    origin_image_size: 1024
+    head_crop_size: 512
+    hand_crop_size: 512
+    # data_path: 'whole_body_dataset'
+    # data_path: 'test_dataset'
+
+
+    datasets:
+
+      - name: 'Sample'  # for testing
+        item:
+            name: 'Sample'
+            urls: ./ehm_datasets/000000.tar
+            epoch_size: 1000
+        weight: 0.1
+
+
+      # # body 
+      # - name: 'MPII_hmr'  
+      #   item: 
+      #       name: 'MPII-hmr'
+      #       urls: ./ehm_datasets/mpii_hmr2/{000000..000014}.tar
+      #       epoch_size: 15_000
+      #   weight: 0.1
+      # - name: 'MPII_inf_hmr' 
+      #   item: 
+      #       name: 'MPII-inf-hmr'
+      #       urls: ./ehm_datasets/mpii_inf_hmr2/{000000..000012}.tar
+      #       epoch_size: 13_000
+      #   weight: 0.02
+      # - name: 'COCO14'
+      #   item: 
+      #       name: 'COCO14-hmr'
+      #       urls: ./ehm_datasets/coco_hmr2/{000000..000027}.tar # only 3 k 
+      #       epoch_size: 28_000
+      #   weight: 0.1
+      # - name: 'COCO14-ViTPose-hmr'
+      #   item:
+      #       name: 'COCO14-vit-hmr'
+      #       urls: ./ehm_datasets/cocovit_hmr2/{000000..000149}.tar
+      #       epoch_size: 150_000
+      #   weight: 0.1
+
+      # - name: 'H36M_hmr'
+      #   item: 
+      #       name: 'H36M-hmr'
+      #       urls: ./ehm_datasets/h36m_hmr2/{000000..000299}.tar
+      #       epoch_size: 300_000
+      #   weight: 0.1
+
+      # - name: 'AVA_hmr'
+      #   item: 
+      #       name: 'AVA-hmr'
+      #       urls: ./ehm_datasets/ava_hmr2/{000000..000369}.tar
+      #       epoch_size: 370_000
+      #   weight: 0.2
+      # - name: 'AIC_hmr'
+      #   item: 
+      #       name: 'AIC-hmr'
+      #       urls: ./ehm_datasets/aic_hmr2/{000000..000649}.tar
+      #       epoch_size: 650_000
+      #   weight: 0.2
+
+      # - name: 'INSTA'
+      #   item: 
+      #       name: 'INSTA-train'
+      #       urls: ./ehm_datasets/insta/{000000..004149}.tar
+      #       epoch_size: 4200_000
+      #   weight: 0.2
+
+      # - name: 'Ours'
+      #   item: 
+      #       name: 'INSTA-train'
+      #       urls: ./ehm_datasets/others/000000.tar
+      #       epoch_size: 1_000
+      #   weight: 0.001
+        
+
+
+
+
+
+      # # face and hand
+
+      # - name: 'MPII'
+      #   item: 
+      #       name: 'MPII-train'
+      #       urls: ./ehm_datasets/mpii_new/{000000..000001}.tar
+      #       epoch_size: 2_000
+      #   weight: 0.01
+
+      # - name: 'COCO14'
+      #   item: 
+      #       name: 'COCO14-train'
+      #       urls: ./ehm_datasets/coco14-tars_new/{000000..000002}.tar # only 3 k 
+      #       epoch_size: 3_000
+      #   weight: 0.01
+      # - name: 'COCO14-ViTPose'
+      #   item:
+      #       name: 'COCO14-vit-train'
+      #       urls: ./ehm_datasets/coco14vit_new/{000000..000005}.tar
+      #       epoch_size: 6_000
+      #   weight: 0.01
+
+
+
+      # - name: 'OurDance' 
+      #   item: 
+      #       name: 'OurDance-train'
+      #       urls: ./ehm_data/wds_output/ours_images_ehm_new/{000000..000013}.tar
+      #       epoch_size: 15_000
+      #   weight: 0.02
+      # - name: 'H36M'
+      #   item: 
+      #       name: 'H36M-train'
+      #       urls: ./ehm_datasets/h36m_new/{000000..000067}.tar
+      #       epoch_size: 33_000
+      #   weight: 0.1
+
+      # - name: 'AVA'
+      #   item: 
+      #       name: 'AVA-train'
+      #       urls: ./ehm_datasets/ava-tars_new/{000000..000045}.tar
+      #       epoch_size: 46_000
+      #   weight: 0.1
+      # - name: 'AIC'  
+      #   item: 
+      #       name: 'AIC-train'
+      #       urls: ./ehm_datasets/aic-tars_new/{000000..000051}.tar
+      #       epoch_size: 53_000
+      #   weight: 0.1
+      # - name: 'INSTA'
+      #   item: 
+      #       name: 'INSTA-train'
+      #       urls: ./ehm_datasets/insta_new/{000000..000271}.tar
+      #       epoch_size: 280_000
+      #   weight: 0.1
+      # - name: 'Ubody' 
+      #   item: 
+      #       name: 'Ubody-train'
+      #       urls: ./ehm_datasets/ubody_train/tracked_ubody_0_1_new/{000000..000619}.tar
+      #       epoch_size: 600_000
+      #   weight: 0.1
+
+
+
+
+
+
+
+
+
+
+    val_datasets:
+
+      - name: 'COCO14-ViTPose-hmr'
+        item:
+            name: 'COCO14-vit-hmr'
+            urls: ./ehm_datasets/000000.tar
+            epoch_size: 1000
+        weight: 0.1
+
+
+
+      # - name: 'COCO14-ViTPose-hmr'
+      #   item:
+      #       name: 'COCO14-vit-hmr'
+      #       urls: ./ehm_datasets/cocovit_hmr2/{000150..000158}.tar
+      #       epoch_size: 150_000
+      #   weight: 0.1
+
+      # - name: 'H36M_hmr'
+      #   item: 
+      #       name: 'H36M-hmr'
+      #       urls: ./ehm_datasets/h36m_hmr2/{000300..000312}.tar
+      #       epoch_size: 300_000
+      #   weight: 0.15
+      # - name: 'AVA_hmr'
+      #   item: 
+      #       name: 'AVA-hmr'
+      #       urls: ./ehm_datasets/ava_hmr2/{000370..000388}.tar
+      #       epoch_size: 370_000
+      #   weight: 0.15
+      # - name: 'AIC_hmr'  
+      #   item: 
+      #       name: 'AIC-hmr'
+      #       urls: ./ehm_datasets/aic_hmr2/{000650..000664}.tar
+      #       epoch_size: 1_000
+      #   weight: 0.15
+
+      # - name: 'OurDance'
+      #   item: 
+      #       name: 'OurDance-train'
+      #       urls: ./ehm_datasets/ours_dance_images_ehm_new/000014.tar
+      #       epoch_size: 1_000
+      #   weight: 0.1
+      # - name: 'H36M'
+      #   item: 
+      #       name: 'H36M-train'
+      #       urls: ./ehm_datasets/h36m_new/{000068..000069}.tar
+      #       epoch_size: 1_000
+      #   weight: 0.1
+      # - name: 'AVA'
+      #   item: 
+      #       name: 'AVA-train'
+      #       urls: ./ehm_datasets/ava-tars_new/000046.tar
+      #       epoch_size: 1_000
+      #   weight: 0.1
+      # - name: 'AIC'
+      #   item: 
+      #       name: 'AIC-train'
+      #       urls: ./ehm_datasets/aic-tars_new/000052.tar
+      #       epoch_size: 1_000
+      #   weight: 0.1
+      # - name: 'INSTA'
+      #   item: 
+      #       name: 'INSTA-train'
+      #       urls: ./ehm_datasets/insta_new/{000271..000272}.tar
+      #       epoch_size: 1_000
+      #   weight: 0.2
+      # - name: 'Agora'  
+      #   item: 
+      #       name: 'Agora-train'
+      #       urls: ./ehm_datasets/agora/{000091..000094}.tar 
+      #       epoch_size: 1_000 
+      #   weight: 0.2
+      # - name: 'Ubody'
+      #   item: 
+      #       name: 'Ubody-train' 
+      #       urls:  ./ehm_datasets/ubody_test/tracked_ubody_0_1_new/{000000..000001}.tar
+      #       epoch_size: 1_000
+      #   weight: 0.2 
