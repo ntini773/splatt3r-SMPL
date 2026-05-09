@@ -60,7 +60,7 @@ def create_workspace(config):
     config.name = time.strftime(config.name, time.localtime())
 
     # Create the results directory
-    os.makedirs(config.save_dir)
+    os.makedirs(config.save_dir,exist_ok=True)
 
     # Save the config to the results directory
     omegaconf.OmegaConf.save(config, os.path.join(config.save_dir, "config.yaml"))

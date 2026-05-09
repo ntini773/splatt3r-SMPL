@@ -30,17 +30,17 @@ loss:
   lpips_loss_weight: 0.25
   normal_loss_weight: 0.0
 
-  # ----------------------------
-  # Background-weight curriculum
-  # ----------------------------
-  # If you want background to mean "outside the human silhouette", set mix=human.
-  # This uses: geom_mask * (human_mask + bw * (1 - human_mask))
-  background_weight_mix: 'human'   # 'geom' (default) or 'human'
+  # ---------------------------
+  # Two-zone weighting schedule
+  # ---------------------------
+  # Human region uses the eroded geom∩human mask with weight 1.0,
+  # everything else uses background_weight.
 
   # Start with a small background weight, then anneal to zero.
-  background_weight: 0.02
+  background_weight: 0.05
   background_weight_end: 0.0
   background_weight_anneal_steps: 2000
+  normalize_soft_mask: false
 
   # Optional adaptive switch-to-zero:
   # If foreground (geom_mask ∩ human_mask) PSNR exceeds this threshold, set bw=0.
@@ -50,6 +50,17 @@ loss:
 
   apply_mask: True
   average_over_mask: True
+
+lora:
+  num_blocks: 2
+  rank: 4
+  alpha: 8.0
+  dropout: 0.0
+
+viz:
+  tsne_every_n_steps: 200
+  tsne_min_step: 0
+  tsne_max_tokens: 4096
 
   # ----------------------------
   # Small crop for robustness

@@ -1,11 +1,14 @@
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:128'
 import sys
+import math
 import torch
 import einops
 import lightning as L
 import lpips
 import omegaconf
+import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.append('src/pixelsplat_src')
 sys.path.append('src/mast3r_src')
@@ -24,6 +27,52 @@ import numpy as np
 import main as splatt3r_main  # gives us MAST3RGaussians with full Lightning checkpoint support
 from src.anatomical_prior.gcn_encoder import AnatomicalGCNEncoder
 from src.anatomical_prior.anatomical_dataset import get_anatomical_dataset
+
+
+class LoRAQKVLinear(nn.Module):
+    """LoRA adapter for fused qkv projections, applying updates to q and v only."""
+
+    def __init__(self, base_linear, rank=4, alpha=8.0, dropout=0.0):
+        super().__init__()
+        if not isinstance(base_linear, nn.Linear):
+            raise TypeError("LoRAQKVLinear expects an nn.Linear base module")
+
+        self.base_linear = base_linear
+        self.base_linear.weight.requires_grad = False
+        if self.base_linear.bias is not None:
+            self.base_linear.bias.requires_grad = False
+
+        self.in_features = base_linear.in_features
+        self.out_features = base_linear.out_features
+        if self.out_features % 3 != 0:
+            raise ValueError("Expected fused qkv out_features divisible by 3")
+
+        self.rank = int(rank)
+        self.alpha = float(alpha)
+        self.scale = self.alpha / max(1, self.rank)
+        self.dropout = nn.Dropout(float(dropout))
+        self.qkv_chunk = self.out_features // 3
+
+        if self.rank > 0:
+            self.lora_A_q = nn.Parameter(torch.empty(self.rank, self.in_features))
+            self.lora_B_q = nn.Parameter(torch.empty(self.qkv_chunk, self.rank))
+            self.lora_A_v = nn.Parameter(torch.empty(self.rank, self.in_features))
+            self.lora_B_v = nn.Parameter(torch.empty(self.qkv_chunk, self.rank))
+            nn.init.kaiming_uniform_(self.lora_A_q, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.lora_A_v, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B_q)
+            nn.init.zeros_(self.lora_B_v)
+
+    def forward(self, x):
+        base_out = self.base_linear(x)
+        if self.rank <= 0:
+            return base_out
+
+        lora_q = F.linear(F.linear(x, self.lora_A_q), self.lora_B_q) * self.scale
+        lora_v = F.linear(F.linear(x, self.lora_A_v), self.lora_B_v) * self.scale
+        lora_k = torch.zeros_like(lora_q)
+        delta = torch.cat([lora_q, lora_k, lora_v], dim=-1)
+        return base_out + self.dropout(delta)
 
 class MAST3RAnatomicalRefinement(L.LightningModule):
     """
@@ -79,6 +128,29 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
         self.encoder.requires_grad_(False)
         self.decoder.requires_grad_(False)
 
+        # Human token-bias injection config.
+        self.human_patch_size = int(getattr(config, 'human_patch_size', 16))
+        dec_embed_dim = getattr(self.encoder, 'dec_embed_dim', self.encoder.decoder_embed.out_features)
+        self.human_type_embed = nn.Embedding(2, dec_embed_dim)
+        nn.init.zeros_(self.human_type_embed.weight)
+
+        # Directly apply LoRA on early decoder blocks (combined Step1+Step2 path).
+        lora_cfg = getattr(config, 'lora', omegaconf.OmegaConf.create())
+        self.lora_num_blocks = int(getattr(lora_cfg, 'num_blocks', 2))
+        self.lora_rank = int(getattr(lora_cfg, 'rank', 4))
+        self.lora_alpha = float(getattr(lora_cfg, 'alpha', 8.0))
+        self.lora_dropout = float(getattr(lora_cfg, 'dropout', 0.0))
+        self._attach_decoder_lora(
+            num_blocks=self.lora_num_blocks,
+            rank=self.lora_rank,
+            alpha=self.lora_alpha,
+            dropout=self.lora_dropout,
+        )
+
+        # Decoder-token visualization cache (for periodic t-SNE plots).
+        self._tsne_payload = None
+        self._tsne_payload_step = -1
+
         # ------------------------------------------------------------------
         # 3. Selectively unfreeze what we want to finetune:
         #      a) The Gaussian DPT regression sub-network (low LR)
@@ -106,18 +178,144 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
             self.encoder.downstream_head1.requires_grad_(True)
             self.encoder.downstream_head2.requires_grad_(True)
 
+        # Explicitly leave new trainable modules enabled.
+        self.human_type_embed.requires_grad_(True)
+        self.gcn_encoder.requires_grad_(True)
+
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"Trainable parameters: {trainable_params:,}")
+
         self.save_hyperparameters()
 
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
+    def _attach_decoder_lora(self, num_blocks=2, rank=4, alpha=8.0, dropout=0.0):
+        if rank <= 0:
+            print("Skipping decoder LoRA because rank <= 0")
+            return
+
+        block_attrs = ('dec_blocks', 'dec_blocks2')
+        for block_attr in block_attrs:
+            dec_blocks = getattr(self.encoder, block_attr)
+            for idx in range(min(num_blocks, len(dec_blocks))):
+                attn = dec_blocks[idx].attn
+                if isinstance(attn.qkv, LoRAQKVLinear):
+                    continue
+                attn.qkv = LoRAQKVLinear(attn.qkv, rank=rank, alpha=alpha, dropout=dropout)
+
+        print(
+            f"Applied decoder LoRA to first {num_blocks} blocks "
+            f"(both branches), rank={rank}, alpha={alpha}, dropout={dropout}"
+        )
+
+    @staticmethod
+    def _to_tensor_mask(mask_like, device):
+        if isinstance(mask_like, np.ndarray):
+            mask = torch.from_numpy(mask_like)
+        else:
+            mask = mask_like
+        if mask.ndim == 4 and mask.shape[1] == 1:
+            mask = mask[:, 0]
+        return mask.to(device=device)
+
+    def _patchify_human_mask(self, mask_like, token_count, device):
+        mask = self._to_tensor_mask(mask_like, device=device).float()
+        if mask.ndim != 3:
+            raise ValueError(f"Expected human mask with shape [B,H,W], got {tuple(mask.shape)}")
+
+        pooled = F.avg_pool2d(
+            mask.unsqueeze(1),
+            kernel_size=self.human_patch_size,
+            stride=self.human_patch_size,
+        ).squeeze(1)
+        flat = (pooled > 0.5).long().flatten(1)
+
+        if flat.shape[1] != token_count:
+            grid = int(math.sqrt(token_count))
+            if grid * grid != token_count:
+                raise ValueError(f"Token count {token_count} is not square and cannot align with mask")
+            resized = F.interpolate(mask.unsqueeze(1), size=(grid * self.human_patch_size, grid * self.human_patch_size), mode='nearest')
+            pooled = F.avg_pool2d(
+                resized,
+                kernel_size=self.human_patch_size,
+                stride=self.human_patch_size,
+            ).squeeze(1)
+            flat = (pooled > 0.5).long().flatten(1)
+
+        return flat
+
+    def _cache_decoder_tokens_for_tsne(self, biased_tokens1, biased_tokens2, token_mask1, token_mask2):
+        viz_cfg = getattr(self.config, 'viz', omegaconf.OmegaConf.create())
+        every_n_steps = int(getattr(viz_cfg, 'tsne_every_n_steps', 200))
+        min_step = int(getattr(viz_cfg, 'tsne_min_step', 0))
+        max_tokens = int(getattr(viz_cfg, 'tsne_max_tokens', 4096))
+
+        if not hasattr(self, 'global_step'):
+            return
+        step = int(self.global_step)
+        if step < min_step or step % max(1, every_n_steps) != 0:
+            return
+        if self._tsne_payload_step == step:
+            return
+
+        labels1 = token_mask1.reshape(-1)
+        labels2 = token_mask2.reshape(-1)
+        features = torch.cat([biased_tokens1.reshape(-1, biased_tokens1.shape[-1]), biased_tokens2.reshape(-1, biased_tokens2.shape[-1])], dim=0)
+        labels = torch.cat([labels1, labels2], dim=0)
+        views = torch.cat([
+            torch.zeros_like(labels1, dtype=torch.long),
+            torch.ones_like(labels2, dtype=torch.long),
+        ], dim=0)
+
+        if features.shape[0] > max_tokens:
+            indices = torch.randperm(features.shape[0], device=features.device)[:max_tokens]
+            features = features[indices]
+            labels = labels[indices]
+            views = views[indices]
+
+        self._tsne_payload = {
+            'features': features.detach().float().cpu(),
+            'labels': labels.detach().long().cpu(),
+            'views': views.detach().long().cpu(),
+        }
+        self._tsne_payload_step = step
+
+    def _decode_with_human_bias(self, feat1, pos1, feat2, pos2, view1, view2):
+        final_output = [(feat1, feat2)]
+
+        f1 = self.encoder.decoder_embed(feat1)
+        f2 = self.encoder.decoder_embed(feat2)
+
+        token_count = f1.shape[1]
+        mask_flat1 = self._patchify_human_mask(view1['mask_human'], token_count=token_count, device=f1.device)
+        mask_flat2 = self._patchify_human_mask(view2['mask_human'], token_count=token_count, device=f2.device)
+
+        bias1 = self.human_type_embed(mask_flat1)
+        bias2 = self.human_type_embed(mask_flat2)
+        f1 = f1 + bias1
+        f2 = f2 + bias2
+
+        self._cache_decoder_tokens_for_tsne(f1, f2, mask_flat1, mask_flat2)
+
+        final_output.append((f1, f2))
+        for blk1, blk2 in zip(self.encoder.dec_blocks, self.encoder.dec_blocks2):
+            f1, _ = blk1(*final_output[-1][::+1], pos1, pos2)
+            f2, _ = blk2(*final_output[-1][::-1], pos2, pos1)
+            final_output.append((f1, f2))
+
+        del final_output[1]
+        final_output[-1] = tuple(map(self.encoder.dec_norm, final_output[-1]))
+        return tuple(zip(*final_output))
+
     def forward(self, view1, view2, adj, anchors1, anchors2):
-        # Frozen backbone — no gradient graph needed here
+        # Freeze encoder image feature extraction, but keep decoder path trainable via LoRA.
         with torch.no_grad():
             (shape1, shape2), (feat1, feat2), (pos1, pos2) = \
                 self.encoder._encode_symmetrized(view1, view2)
-            dec1, dec2 = self.encoder._decoder(feat1, pos1, feat2, pos2)
+
+        dec1, dec2 = self._decode_with_human_bias(feat1, pos1, feat2, pos2, view1, view2)
 
         # GCN encoder is trainable — stays in the autograd graph
         prior1 = self.gcn_encoder(anchors1, adj)   # [B, 512, 32]
@@ -206,6 +404,67 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
         self.log_metrics('train', loss, mse, lpips_val)
         return loss
 
+    @staticmethod
+    def _build_two_zone_soft_mask(human_mask, background_weight, normalize=False):
+        human_mask = human_mask.float()
+        soft_mask = human_mask + (1.0 - human_mask) * float(background_weight)
+        if normalize:
+            denom = soft_mask.sum(dim=(-1, -2), keepdim=True).clamp(min=1e-8)
+            soft_mask = soft_mask / denom
+        return soft_mask
+
+    def _save_decoder_tsne_plot(self, viz_dir, step):
+        if self._tsne_payload is None or self._tsne_payload_step != int(step):
+            return
+
+        try:
+            from sklearn.manifold import TSNE
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            print(f"Skipping t-SNE plot because dependency is unavailable: {exc}")
+            return
+
+        payload = self._tsne_payload
+        features = payload['features'].numpy()
+        labels = payload['labels'].numpy()
+        views = payload['views'].numpy()
+        sample_count = features.shape[0]
+        if sample_count < 10:
+            return
+
+        perplexity = max(5, min(30, (sample_count - 1) // 3))
+        tsne = TSNE(
+            n_components=2,
+            perplexity=perplexity,
+            init='pca',
+            learning_rate='auto',
+            random_state=42,
+        )
+        coords = tsne.fit_transform(features)
+
+        fg_mask = labels == 1
+        bg_mask = labels == 0
+        view0 = views == 0
+        view1 = views == 1
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.scatter(coords[bg_mask & view0, 0], coords[bg_mask & view0, 1], s=8, c='#777777', alpha=0.55, marker='o', label='bg view0')
+        ax.scatter(coords[bg_mask & view1, 0], coords[bg_mask & view1, 1], s=8, c='#bbbbbb', alpha=0.55, marker='^', label='bg view1')
+        ax.scatter(coords[fg_mask & view0, 0], coords[fg_mask & view0, 1], s=9, c='#0b8f3d', alpha=0.75, marker='o', label='human view0')
+        ax.scatter(coords[fg_mask & view1, 0], coords[fg_mask & view1, 1], s=9, c='#0d5bd4', alpha=0.75, marker='^', label='human view1')
+        ax.set_title('Decoder Input Tokens t-SNE (post human bias, pre decoder blocks)')
+        ax.set_xlabel('t-SNE dim 1')
+        ax.set_ylabel('t-SNE dim 2')
+        ax.legend(loc='best', fontsize=8)
+        fig.tight_layout()
+
+        tsne_path = os.path.join(viz_dir, f"tsne_step_{step:06d}.png")
+        fig.savefig(tsne_path, dpi=120)
+        plt.close(fig)
+        print(f"Saved t-SNE visualization to {tsne_path}")
+
     def calculate_loss(self, batch, pred1, pred2, color, geom_mask, dataset_human_mask, apply_mask=True, average_over_mask=True):
         target_color = torch.stack([target_view['original_img'] for target_view in batch['target']], dim=1)
         predicted_color = color
@@ -223,29 +482,15 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
         else:
             mask = final_mask.float()
 
-        # ── Three-zone soft mask ────────────────────────────────────────────
-        # Zone 1: Inner human (eroded intersection mask)          weight = 1.0
-        # Zone 2: Human boundary ring (silhouette minus erosion)  weight = 0.5 fixed
-        #          This protects real human pixels that fall outside the strict
-        #          geom intersection — they always keep a gradient signal.
-        # Zone 3: Background (everything outside silhouette)      weight = bg_weight
-        #          Decays via schedule but floors at bg_weight_floor to avoid
-        #          opacity collapse from complete zero-gradient regions.
-        #
-        # Note: LPIPS is still human-only (inner zone 1 only) — unchanged.
+        # Two-zone soft weighting over the eroded geom∩human region and background.
         background_weight = self._current_bg_weight
-        boundary_weight = getattr(self.config.loss, 'boundary_weight', 0.5)
-
-        inner_human  = mask.float()                           # eroded intersection [B,V,H,W]
-        human_sil    = dataset_human_mask.float()             # full dataset silhouette
-        boundary_ring = (human_sil - inner_human).clamp(0, 1) # ring between silhouette & eroded core
-        background    = 1.0 - human_sil                       # everything outside silhouette
-
-        soft_mask = (
-            inner_human * 1.0
-            + boundary_ring * boundary_weight
-            + background * background_weight
-        )  # [B, V, H, W]
+        normalize_soft_mask = bool(getattr(self.config.loss, 'normalize_soft_mask', False))
+        inner_human = mask.float()
+        soft_mask = self._build_two_zone_soft_mask(
+            human_mask=inner_human,
+            background_weight=background_weight,
+            normalize=normalize_soft_mask,
+        )
 
         # human_mask for LPIPS: use inner eroded core only (strict)
         human_mask = inner_human
@@ -335,6 +580,7 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
         save_path = os.path.join(viz_dir, f"step_{step:06d}.jpg")
         save_image(grid, save_path)
         print(f"Saved visualization to {save_path}")
+        self._save_decoder_tsne_plot(viz_dir, step)
 
     def log_metrics(self, prefix, loss, mse, lpips, ssim=None):
         values = {
@@ -350,20 +596,50 @@ class MAST3RAnatomicalRefinement(L.LightningModule):
 
     def configure_optimizers(self):
         # Two param groups with different LRs:
-        #   - GCN encoder + prior_attention: train from scratch at full LR
+        #   - GCN encoder + prior_attention + human token bias + decoder LoRA: full LR
         #   - Gaussian DPT: pretrained weights, 10x lower LR to preserve quality
+        lora_params = [
+            p for n, p in self.named_parameters()
+            if ('lora_A_' in n or 'lora_B_' in n) and p.requires_grad
+        ]
+
         gcn_and_attn_params = (
             list(self.gcn_encoder.parameters()) +
             list(self.encoder.downstream_head1.prior_attention.parameters()) +
-            list(self.encoder.downstream_head2.prior_attention.parameters())
+            list(self.encoder.downstream_head2.prior_attention.parameters()) +
+            list(self.human_type_embed.parameters()) +
+            lora_params
         )
         dpt_params = (
             list(self.encoder.downstream_head1.gaussian_dpt.dpt.parameters()) +
             list(self.encoder.downstream_head2.gaussian_dpt.dpt.parameters())
         )
+
+        # Deduplicate parameters in case modules appear in multiple lists.
+        unique = set()
+        unique_gcn_attn = []
+        for param in gcn_and_attn_params:
+            if id(param) in unique:
+                continue
+            unique.add(id(param))
+            unique_gcn_attn.append(param)
+
+        unique_dpt = []
+        for param in dpt_params:
+            if id(param) in unique:
+                continue
+            unique.add(id(param))
+            unique_dpt.append(param)
+
+        print(
+            "Optimizer groups - "
+            f"gcn/attn/human/lora: {sum(p.numel() for p in unique_gcn_attn):,} params, "
+            f"dpt: {sum(p.numel() for p in unique_dpt):,} params"
+        )
+
         param_groups = [
-            {'params': gcn_and_attn_params, 'lr': self.config.opt.lr, 'name': 'gcn_and_attention'},
-            {'params': dpt_params, 'lr': self.config.opt.lr * 0.1, 'name': 'gaussian_dpt'},
+            {'params': unique_gcn_attn, 'lr': self.config.opt.lr, 'name': 'gcn_attn_human_lora'},
+            {'params': unique_dpt, 'lr': self.config.opt.lr * 0.1, 'name': 'gaussian_dpt'},
         ]
         optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-2)
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [self.config.opt.epochs // 2], gamma=0.1)

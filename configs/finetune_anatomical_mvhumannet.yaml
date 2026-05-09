@@ -37,7 +37,7 @@ data:
 
 opt:
   # 30-epoch full run
-  epochs: 30
+  epochs: 15
   
   # Base LR. (Remember: Gaussian DPT automatically uses 0.1x of this!)
   lr: 0.00002
@@ -50,20 +50,29 @@ loss:
   mse_loss_weight: 1.0
   lpips_loss_weight: 0.5
 
-  
   # ── Background Weight Schedule ───────────────────────────────────────────
-  # Three-zone soft mask:
-  #   Zone 1: Inner eroded human (intersection of geom+silhouette, then eroded) → weight 1.0
-  #   Zone 2: Boundary ring (silhouette minus eroded core)                       → boundary_weight (fixed, never decays)
-  #   Zone 3: Background (outside silhouette)                                    → background_weight (decays, floored)
+  # Two-zone soft mask:
+  #   Zone 1: Inner eroded human (geom∩human, then eroded) → weight 1.0
+  #   Zone 2: Background                                   → background_weight (decays, floored)
   #
   # background_weight decays linearly from initial → bg_weight_floor over bg_schedule_end_epoch epochs.
   # Gated: decay doesn't begin until train/psnr >= bg_schedule_psnr_gate.
-  background_weight: 0.1
+  background_weight: 0.05
   bg_weight_floor: 0.05        # never let background go below this (prevents opacity collapse)
-  boundary_weight: 0.3          # fixed weight for the human boundary ring (mask imperfection buffer)
   bg_schedule_end_epoch: 20    # background weight reaches floor at epoch 20 (out of 30)
   bg_schedule_psnr_gate: 7.0   # don't start decay until PSNR >= 7 dB
+  normalize_soft_mask: false   # keep weighted-average behavior; enable only for strict probability maps
 
   apply_mask: True
   average_over_mask: True
+
+lora:
+  num_blocks: 2
+  rank: 4
+  alpha: 8.0
+  dropout: 0.0
+
+viz:
+  tsne_every_n_steps: 200
+  tsne_min_step: 0
+  tsne_max_tokens: 4096

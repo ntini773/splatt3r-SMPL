@@ -183,8 +183,17 @@ def _move_to_device(value, device):
     return value
 
 
+def _build_two_zone_soft_mask(human_mask, background_weight, normalize=False):
+    human_mask = human_mask.float()
+    soft_mask = human_mask + (1.0 - human_mask) * float(background_weight)
+    if normalize:
+        denom = soft_mask.sum(dim=(-1, -2), keepdim=True).clamp(min=1e-8)
+        soft_mask = soft_mask / denom
+    return soft_mask
+
+
 @torch.no_grad()
-def _evaluate_batch(model, batch, loss_weights, average_over_mask=True, background_weight=0.1):
+def _evaluate_batch(model, batch, loss_weights, average_over_mask=True, background_weight=0.1, normalize_soft_mask=False):
     device = next(model.parameters()).device
     batch = _move_to_device(batch, device)
 
@@ -216,7 +225,7 @@ def _evaluate_batch(model, batch, loss_weights, average_over_mask=True, backgrou
         loss_mask_tensor = final_mask.float()
 
     human_mask = loss_mask_tensor.float()
-    soft_mask = human_mask + background_weight * (1.0 - human_mask)
+    soft_mask = _build_two_zone_soft_mask(human_mask, background_weight, normalize=normalize_soft_mask)
 
     flattened_color = einops.rearrange(predicted_color, 'b v c h w -> (b v) c h w')
     flattened_target_color = einops.rearrange(target_color, 'b v c h w -> (b v) c h w')
@@ -303,6 +312,7 @@ def run_benchmark(config):
     }
     average_over_mask = getattr(config.loss, 'average_over_mask', True)
     background_weight = getattr(config.loss, 'background_weight', 0.1)
+    normalize_soft_mask = bool(getattr(config.loss, 'normalize_soft_mask', False))
 
     aggregate = {'loss': [], 'mse': [], 'psnr': [], 'lpips': [], 'ssim': [], 'normal': []}
     per_sample = {}
@@ -314,6 +324,7 @@ def run_benchmark(config):
             loss_weights=loss_weights,
             average_over_mask=average_over_mask,
             background_weight=background_weight,
+            normalize_soft_mask=normalize_soft_mask,
         )
 
         scene = batch['scene'][0] if isinstance(batch['scene'], list) else batch['scene']
